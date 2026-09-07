@@ -165,9 +165,14 @@ class TestHappyPath:
                 assert (
                     config_dir / "projects" / project_key / f"{SESSION_ID}.jsonl"
                 ).is_file()
-                task = config_dir / "tasks" / "stable-list" / "1.json"
-                task.parent.mkdir(parents=True)
-                task.write_text('{"subject":"resume me"}')
+                state = (
+                    config_dir
+                    / "extension-state"
+                    / key["project_key"]
+                    / f"{key['session_id']}.json"
+                )
+                state.parent.mkdir(parents=True)
+                state.write_text('{"subject":"resume me"}')
 
         store = AuxiliaryStore()
         await store.append(
@@ -181,7 +186,7 @@ class TestHappyPath:
         assert m is not None
         assert m.key == {"project_key": project_key, "session_id": SESSION_ID}
         assert (
-            m.config_dir / "tasks" / "stable-list" / "1.json"
+            m.config_dir / "extension-state" / project_key / f"{SESSION_ID}.json"
         ).read_text() == '{"subject":"resume me"}'
         await m.cleanup()
 

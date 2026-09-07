@@ -43,6 +43,27 @@ S3 and Redis have in-process mocks (`moto`, `fakeredis`); Postgres is
 live-only. The live e2e suites for all three skip unless the corresponding
 `SESSION_STORE_*` env vars are set — see each section below.
 
+## Optional auxiliary state
+
+Adapters may implement `materialize_auxiliary_state()` and
+`persist_auxiliary_state()` for session-scoped files that are not part of the
+transcript. The SDK deliberately does not define those files or their storage
+format.
+
+- Treat the supplied `(project_key, session_id)` as the ownership boundary.
+  On ordinary runs, `config_dir` may be shared by multiple sessions; use an
+  explicit adapter-owned path mapping or manifest and never snapshot the whole
+  directory.
+- `materialize_auxiliary_state()` receives an isolated temporary config
+  directory for the resumed session. An unhandled restore error aborts resume.
+- `persist_auxiliary_state()` should write a complete, idempotent snapshot.
+  Checkpoint failures are non-fatal and reported as `MirrorErrorMessage`.
+- If the adapter implements auxiliary state, deleting a main session key in
+  `delete()` must remove that state as well as transcript subkeys. Retention
+  policies must cover both.
+- `fork_session_via_store()` transforms the transcript only. Auxiliary state
+  is not copied because its fork semantics are adapter- and format-specific.
+
 ## Production checklist
 
 These adapters are reference code. Before running one in production, work

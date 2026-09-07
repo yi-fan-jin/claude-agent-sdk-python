@@ -860,9 +860,9 @@ async def delete_session_via_store(
     (appropriate for WORM/append-only backends — matches the
     :class:`SessionStore` contract).
 
-    Whether subagent transcripts under the session are also removed depends
-    on the store's ``delete({session_id})`` semantics —
-    :class:`InMemorySessionStore` cascades; custom stores may not.
+    The :class:`SessionStore` contract requires deleting a main session key to
+    cascade to its transcript subkeys and any auxiliary state owned by the
+    adapter for that session.
 
     Args:
         session_store: The store to delete from.

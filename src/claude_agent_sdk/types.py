@@ -1592,7 +1592,7 @@ class SessionStore(Protocol):
 
     The SDK never deletes from your store unless you call
     ``delete_session_via_store()`` with :meth:`delete` implemented. Retention is
-    the adapter's responsibility —
+    the adapter's responsibility for transcripts and any auxiliary state —
     implement TTL, object-storage lifecycle policies, or scheduled cleanup
     according to your compliance requirements (e.g. ZDR/HIPAA retention
     windows). Local-disk transcripts under ``CLAUDE_CONFIG_DIR`` are swept by
@@ -1684,9 +1684,9 @@ class SessionStore(Protocol):
         """Delete a session.
 
         Deleting a main-transcript key (no ``subpath``) must cascade to all
-        subkeys under that session so subagent transcripts aren't orphaned. A
-        targeted delete with an explicit ``subpath`` removes only that one
-        entry.
+        subkeys and auxiliary state owned by the adapter for that session so
+        durable state isn't orphaned. A targeted delete with an explicit
+        ``subpath`` removes only that one transcript entry.
 
         Optional — if unimplemented, deletion is a no-op (appropriate for
         WORM/append-only backends like object storage).
@@ -1710,12 +1710,17 @@ class SessionStore(Protocol):
 
         Called during store-backed resume after the SDK has materialized the
         transcript, auth, settings, and subagent files, but before the Claude
-        Code subprocess starts. Implementations may restore state such as task
-        lists or plans beneath the supplied ``CLAUDE_CONFIG_DIR``.
+        Code subprocess starts. ``config_dir`` is an isolated temporary
+        ``CLAUDE_CONFIG_DIR`` for ``key``. Implementations choose which files
+        they own and how those files map to the supplied session key; the SDK
+        does not interpret auxiliary file layouts.
 
         Optional — if unimplemented, resume restores transcripts only.
         Auxiliary state must exclude credentials, and implementations must not
-        overwrite the SDK-managed transcript/auth/settings files.
+        overwrite the SDK-managed transcript/auth/settings files. Exceptions
+        abort resume; an adapter that intentionally supports degraded resume
+        must handle that policy internally without later overwriting a valid
+        stored snapshot with incomplete local state.
         """
         raise NotImplementedError
 
@@ -1732,9 +1737,13 @@ class SessionStore(Protocol):
         config directory.
 
         Optional — if unimplemented, only transcripts are mirrored.
+        ``config_dir`` may be shared by multiple sessions outside a
+        store-backed resume, so implementations must use ``key`` plus an
+        explicit adapter-owned path mapping or manifest to select only that
+        session's files. Never snapshot the whole config directory.
         Implementations should persist a complete, idempotent snapshot and
         must not persist credentials or SDK-managed transcript/auth/settings
-        files.
+        files. Concurrent calls for different keys must remain isolated.
         """
         raise NotImplementedError
 

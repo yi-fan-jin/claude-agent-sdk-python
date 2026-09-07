@@ -194,8 +194,13 @@ class _AuxiliaryStateStore(_RecordingStore):
         self.state_calls: list[tuple[dict[str, str], Path, str]] = []
 
     async def persist_auxiliary_state(self, key, config_dir):
-        task = config_dir / "tasks" / "stable-list" / "1.json"
-        self.state_calls.append((dict(key), config_dir, task.read_text()))
+        state = (
+            config_dir
+            / "extension-state"
+            / key["project_key"]
+            / f"{key['session_id']}.json"
+        )
+        self.state_calls.append((dict(key), config_dir, state.read_text()))
 
 
 class TestTranscriptMirrorBatcher:
@@ -222,9 +227,10 @@ class TestTranscriptMirrorBatcher:
         self, tmp_path: Path
     ) -> None:
         config_dir = tmp_path / "config"
-        task = config_dir / "tasks" / "stable-list" / "1.json"
-        task.parent.mkdir(parents=True)
-        task.write_text('{"status":"in_progress"}')
+        state_dir = config_dir / "extension-state" / "proj"
+        state_dir.mkdir(parents=True)
+        (state_dir / "sess.json").write_text('{"status":"in_progress"}')
+        (state_dir / "another-session.json").write_text('{"status":"pending"}')
         store = _AuxiliaryStateStore()
         batcher = TranscriptMirrorBatcher(
             store=store,
@@ -797,9 +803,9 @@ class TestReceiveLoopFramePeeling:
     ) -> None:
         async def _test() -> None:
             config_dir = tmp_path / "config"
-            task = config_dir / "tasks" / "stable-list" / "1.json"
-            task.parent.mkdir(parents=True)
-            task.write_text('{"status":"completed"}')
+            state = config_dir / "extension-state" / "proj" / "sess.json"
+            state.parent.mkdir(parents=True)
+            state.write_text('{"status":"completed"}')
             projects_dir = config_dir / "projects"
             store = _AuxiliaryStateStore()
             mock_transport = _make_mock_transport(
