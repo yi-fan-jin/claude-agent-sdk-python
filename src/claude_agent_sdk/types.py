@@ -1749,7 +1749,11 @@ class SessionStoreAuxiliaryState(Protocol):
         After any transcript write is dropped or the output reader ends
         abnormally, the SDK stops publishing auxiliary snapshots for that
         client so a newer snapshot cannot be paired with an older transcript
-        on the next resume.
+        on the next resume. Implementing this method opts the store into a
+        strict final checkpoint: ``disconnect()`` raises
+        :class:`SessionStoreCheckpointError` when transcript or auxiliary
+        persistence is incomplete, and returns normally only after the
+        snapshot is durable.
 
         Optional — if unimplemented, only transcripts are mirrored.
         ``config_dir`` may be shared by multiple sessions outside a

@@ -7,6 +7,10 @@ class ClaudeSDKError(Exception):
     """Base exception for all Claude SDK errors."""
 
 
+class SessionStoreCheckpointError(ClaudeSDKError):
+    """Raised when a final auxiliary session checkpoint is not durable."""
+
+
 class CLIConnectionError(ClaudeSDKError):
     """Raised when unable to connect to Claude Code."""
 

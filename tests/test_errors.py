@@ -7,6 +7,7 @@ from claude_agent_sdk import (
     CLINotFoundError,
     ProcessError,
     ResultError,
+    SessionStoreCheckpointError,
 )
 
 
@@ -30,6 +31,11 @@ class TestErrorTypes:
         error = CLIConnectionError("Failed to connect to CLI")
         assert isinstance(error, ClaudeSDKError)
         assert "Failed to connect to CLI" in str(error)
+
+    def test_session_store_checkpoint_error(self):
+        error = SessionStoreCheckpointError("checkpoint failed")
+        assert isinstance(error, ClaudeSDKError)
+        assert str(error) == "checkpoint failed"
 
     def test_process_error(self):
         """Test ProcessError with exit code and stderr."""

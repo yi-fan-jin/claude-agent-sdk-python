@@ -36,6 +36,7 @@ from ._errors import (
     CLINotFoundError,
     ProcessError,
     ResultError,
+    SessionStoreCheckpointError,
 )
 from ._internal._mcp_compat import build_tool_server
 from ._internal.session_import import import_session_to_store
@@ -766,6 +767,7 @@ __all__ = [
     "ToolAnnotations",
     # Errors
     "ClaudeSDKError",
+    "SessionStoreCheckpointError",
     "CLIConnectionError",
     "CLINotFoundError",
     "ProcessError",

@@ -25,6 +25,7 @@ from claude_agent_sdk import (
     ResultError,
     ResultMessage,
     SessionKey,
+    SessionStoreCheckpointError,
     query,
 )
 from claude_agent_sdk._internal import (
@@ -313,7 +314,13 @@ class TestTranscriptMirrorBatcher:
         )
 
         sleep_mock = AsyncMock()
-        with patch(_BATCHER_SLEEP, new=sleep_mock):
+        with (
+            patch(_BATCHER_SLEEP, new=sleep_mock),
+            pytest.raises(
+                SessionStoreCheckpointError,
+                match="auxiliary-state persistence timed out after 0.01s",
+            ),
+        ):
             await batcher.close()
 
         assert store.attempts == 1
@@ -354,7 +361,13 @@ class TestTranscriptMirrorBatcher:
         state.write_text('{"status":"newer_than_transcript"}')
         batcher.enqueue(_main_path(), [{"type": "assistant", "n": 2}])
 
-        with patch(_BATCHER_SLEEP, new=AsyncMock()):
+        with (
+            patch(_BATCHER_SLEEP, new=AsyncMock()),
+            pytest.raises(
+                SessionStoreCheckpointError,
+                match="transcript persistence incomplete",
+            ),
+        ):
             await batcher.close()
 
         assert store.state_calls == []
@@ -442,8 +455,14 @@ class TestTranscriptMirrorBatcher:
 
         await query_instance.start()
         await overflow_message_yielded.wait()
-        with caplog.at_level(
-            logging.ERROR, logger=transcript_mirror_batcher_module.__name__
+        with (
+            caplog.at_level(
+                logging.ERROR, logger=transcript_mirror_batcher_module.__name__
+            ),
+            pytest.raises(
+                SessionStoreCheckpointError,
+                match="transcript persistence incomplete",
+            ),
         ):
             await query_instance.close()
         query_instance.close_receive_stream()
@@ -560,9 +579,15 @@ class TestTranscriptMirrorBatcher:
 
         await query_instance.start()
         await process_wait_started.wait()
-        with patch(
-            "claude_agent_sdk._internal.transport.subprocess_cli.anyio.fail_after",
-            side_effect=TimeoutError,
+        with (
+            patch(
+                "claude_agent_sdk._internal.transport.subprocess_cli.anyio.fail_after",
+                side_effect=TimeoutError,
+            ),
+            pytest.raises(
+                SessionStoreCheckpointError,
+                match="transcript persistence incomplete",
+            ),
         ):
             await query_instance.close()
 
@@ -612,7 +637,11 @@ class TestTranscriptMirrorBatcher:
                     and query_instance._read_task.done()
                 )
             )
-            await query_instance.close()
+            with pytest.raises(
+                SessionStoreCheckpointError,
+                match="transcript persistence incomplete",
+            ):
+                await query_instance.close()
         query_instance.close_receive_stream()
 
         assert len(store.append_calls) == 1
@@ -662,7 +691,11 @@ class TestTranscriptMirrorBatcher:
                 and query_instance._read_task.done()
             )
         )
-        await query_instance.close()
+        with pytest.raises(
+            SessionStoreCheckpointError,
+            match="transcript persistence incomplete",
+        ):
+            await query_instance.close()
 
         assert len(store.append_calls) == 1
         assert store.state_calls == []
@@ -1310,13 +1343,16 @@ class TestReceiveLoopFramePeeling:
                 patch(_BATCHER_SLEEP, new=AsyncMock()),
             ):
                 mock_cls.return_value = mock_transport
-                messages = [
-                    message
+                messages = []
+                with pytest.raises(
+                    SessionStoreCheckpointError,
+                    match="transcript persistence incomplete",
+                ):
                     async for message in query(
                         prompt="Hello",
                         options=ClaudeAgentOptions(session_store=store),
-                    )
-                ]
+                    ):
+                        messages.append(message)
 
             assert any(isinstance(message, ResultMessage) for message in messages)
             assert len(store.append_calls) == 1
@@ -1592,8 +1628,8 @@ class TestReceiveLoopFramePeeling:
 
         anyio.run(_test)
 
-    def test_auxiliary_state_failure_is_logged_after_stream_drain(
-        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    def test_auxiliary_state_failure_raises_after_stream_drain(
+        self, tmp_path: Path
     ) -> None:
         async def _test() -> None:
             class FailingStateStore(InMemorySessionStore):
@@ -1627,29 +1663,24 @@ class TestReceiveLoopFramePeeling:
                     "claude_agent_sdk._internal.session_resume._get_projects_dir",
                     return_value=projects_dir,
                 ),
-                caplog.at_level(
-                    logging.ERROR,
-                    logger=transcript_mirror_batcher_module.__name__,
-                ),
                 patch(_BATCHER_SLEEP, new=AsyncMock()),
             ):
                 mock_cls.return_value = mock_transport
                 store = FailingStateStore()
-                messages = [
-                    m
-                    async for m in query(
+                messages = []
+                with pytest.raises(
+                    SessionStoreCheckpointError,
+                    match="auxiliary-state persistence failed",
+                ):
+                    async for message in query(
                         prompt="Hello",
                         options=ClaudeAgentOptions(session_store=store),
-                    )
-                ]
+                    ):
+                        messages.append(message)
 
             mirror_errors = [m for m in messages if isinstance(m, MirrorErrorMessage)]
             assert mirror_errors == []
             assert store.attempts == 3
-            assert any(
-                "state backend unavailable" in record.message
-                for record in caplog.records
-            )
             assert any(isinstance(m, ResultMessage) for m in messages)
 
         anyio.run(_test)

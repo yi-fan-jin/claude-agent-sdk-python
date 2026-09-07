@@ -20,6 +20,7 @@ from typing import cast
 
 import anyio
 
+from .._errors import SessionStoreCheckpointError
 from ..types import (
     SessionKey,
     SessionListSubkeysKey,
@@ -63,11 +64,12 @@ class TranscriptMirrorBatcher:
     Adapter failures are retried (``MIRROR_APPEND_MAX_ATTEMPTS`` attempts
     total) with short backoff; timeouts are not retried since the in-flight
     call may still land. Only after the final attempt fails is the batch
-    dropped and reported via ``on_error``. Failures never raise — the
-    local-disk transcript is already durable so the session must continue
-    unaffected. Adapters should dedupe by ``entry["uuid"]`` when present
-    (some entry types lack a uuid) since a retried batch may partially
-    overlap a prior partial write.
+    dropped and reported via ``on_error``. Transcript-only stores retain this
+    non-fatal behavior. Stores implementing ``SessionStoreAuxiliaryState``
+    receive a strict final checkpoint: ``close()`` raises when transcript or
+    auxiliary persistence is incomplete. Adapters should dedupe by
+    ``entry["uuid"]`` when present (some entry types lack a uuid) since a
+    retried batch may partially overlap a prior partial write.
     """
 
     store: SessionStore
@@ -127,18 +129,30 @@ class TranscriptMirrorBatcher:
         self._transcript_healthy = False
 
     async def close(self) -> None:
-        """Final transcript flush and auxiliary-state checkpoint. Never raises.
+        """Flush transcripts and publish a final auxiliary-state checkpoint.
 
         Shielded so the final batch still reaches the store when ``close()``
         runs under a cancelled scope (client disconnect / Ctrl+C at
-        ``__aexit__``).
+        ``__aexit__``). Existing transcript-only stores retain their non-fatal
+        mirror behavior. A store implementing ``SessionStoreAuxiliaryState``
+        opts into a strict checkpoint: an incomplete transcript or failed
+        auxiliary snapshot raises ``SessionStoreCheckpointError``.
         """
-        try:
-            with anyio.CancelScope(shield=True):
-                if await self.flush():
-                    await self._persist_auxiliary_state()
-        except Exception as e:  # pragma: no cover - defensive
-            logger.debug(f"[TranscriptMirrorBatcher] close flush failed: {e}")
+        with anyio.CancelScope(shield=True):
+            key = self._session_key or self.resume_key
+            checkpoint_required = (
+                self.config_dir is not None
+                and key is not None
+                and _store_implements(self.store, "persist_auxiliary_state")
+            )
+            if not await self.flush():
+                if checkpoint_required:
+                    raise SessionStoreCheckpointError(
+                        "transcript persistence incomplete; auxiliary state was not saved"
+                    )
+                return
+            if checkpoint_required:
+                await self._persist_auxiliary_state()
 
     async def _persist_auxiliary_state(self) -> None:
         if self.config_dir is None or not _store_implements(
@@ -158,15 +172,14 @@ class TranscriptMirrorBatcher:
                 with anyio.fail_after(self.send_timeout):
                     await auxiliary_store.persist_auxiliary_state(key, self.config_dir)
                 return
-            except TimeoutError:
+            except TimeoutError as e:
                 # As with transcript append, an adapter wrapping
                 # non-cancellable I/O may still publish after our timeout.
                 # Retrying could therefore race two snapshots.
-                logger.error(
-                    "[SessionStore] persist_auxiliary_state() timed out after %.1fs",
-                    self.send_timeout,
-                )
-                return
+                raise SessionStoreCheckpointError(
+                    "auxiliary-state persistence timed out after "
+                    f"{self.send_timeout:g}s"
+                ) from e
             except Exception as e:  # noqa: BLE001 - adapter is user code
                 last_err = e
                 logger.debug(
@@ -176,7 +189,9 @@ class TranscriptMirrorBatcher:
                     e,
                 )
 
-        logger.error("[SessionStore] persist_auxiliary_state() failed: %s", last_err)
+        raise SessionStoreCheckpointError(
+            "auxiliary-state persistence failed"
+        ) from last_err
 
     async def _drain(self) -> bool:
         """Detach the pending buffer, await any prior flush, then send.

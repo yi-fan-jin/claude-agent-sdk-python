@@ -6,7 +6,12 @@ from unittest.mock import AsyncMock, Mock, patch
 import anyio
 import pytest
 
-from claude_agent_sdk import AssistantMessage, ClaudeAgentOptions, query
+from claude_agent_sdk import (
+    AssistantMessage,
+    ClaudeAgentOptions,
+    SessionStoreCheckpointError,
+    query,
+)
 from claude_agent_sdk.types import TextBlock
 
 
@@ -362,5 +367,40 @@ class TestClaudeSDKClientResourceCleanup:
             await client.disconnect()
             with pytest.raises(ClosedResourceError):
                 receive_stream.receive_nowait()
+
+        anyio.run(_test)
+
+    def test_checkpoint_failure_keeps_materialized_state_for_disconnect_retry(self):
+        from claude_agent_sdk import ClaudeSDKClient
+
+        async def _test():
+            transport = AsyncMock()
+            query_instance = AsyncMock()
+            query_instance.close.side_effect = [
+                SessionStoreCheckpointError("checkpoint failed"),
+                None,
+            ]
+            query_instance.close_receive_stream = Mock()
+            materialized = Mock()
+            materialized.cleanup = AsyncMock()
+
+            client = ClaudeSDKClient(transport=transport)
+            client._transport = transport
+            client._query = query_instance
+            client._materialized = materialized
+
+            with pytest.raises(SessionStoreCheckpointError, match="checkpoint failed"):
+                await client.disconnect()
+
+            assert client._query is query_instance
+            assert client._materialized is materialized
+            materialized.cleanup.assert_not_awaited()
+
+            await client.disconnect()
+
+            assert query_instance.close.await_count == 2
+            materialized.cleanup.assert_awaited_once()
+            assert client._query is None
+            assert client._materialized is None
 
         anyio.run(_test)
