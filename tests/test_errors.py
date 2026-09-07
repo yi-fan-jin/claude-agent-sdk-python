@@ -1,5 +1,8 @@
 """Tests for Claude SDK error handling."""
 
+import copy
+import pickle
+
 from claude_agent_sdk import (
     ClaudeSDKError,
     CLIConnectionError,
@@ -33,10 +36,16 @@ class TestErrorTypes:
         assert "Failed to connect to CLI" in str(error)
 
     def test_session_store_checkpoint_error(self):
-        error = SessionStoreCheckpointError("checkpoint failed", retryable=True)
+        error = SessionStoreCheckpointError("checkpoint failed")
         assert isinstance(error, ClaudeSDKError)
         assert str(error) == "checkpoint failed"
         assert error.retryable is True
+
+    def test_session_store_checkpoint_error_preserves_retryable(self):
+        error = SessionStoreCheckpointError("checkpoint failed", retryable=False)
+        for restored in (copy.copy(error), pickle.loads(pickle.dumps(error))):
+            assert str(restored) == "checkpoint failed"
+            assert restored.retryable is False
 
     def test_process_error(self):
         """Test ProcessError with exit code and stderr."""

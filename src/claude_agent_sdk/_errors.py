@@ -15,9 +15,14 @@ class SessionStoreCheckpointError(ClaudeSDKError):
     so the client has already torn down its temporary session state.
     """
 
-    def __init__(self, message: str, *, retryable: bool):
+    def __init__(self, message: str, retryable: bool = True):
         self.retryable = retryable
         super().__init__(message)
+
+    def __reduce__(
+        self,
+    ) -> tuple[type["SessionStoreCheckpointError"], tuple[str, bool]]:
+        return type(self), (str(self), self.retryable)
 
 
 class CLIConnectionError(ClaudeSDKError):
