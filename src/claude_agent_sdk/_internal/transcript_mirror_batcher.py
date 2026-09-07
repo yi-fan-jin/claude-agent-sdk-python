@@ -78,9 +78,8 @@ class TranscriptMirrorBatcher:
     _flush_task: TaskHandle | None = None
     _lock: anyio.Lock = field(default_factory=anyio.Lock)
     _session_key: SessionListSubkeysKey | None = None
-    _state_generation: int = 0
-    _persisted_state_generation: int = 0
-    _reported_state_generation: int = 0
+    _transcript_healthy: bool = True
+    _auxiliary_error_reported: bool = False
     _state_lock: anyio.Lock = field(default_factory=anyio.Lock)
 
     def enqueue(self, file_path: str, entries: list[SessionStoreEntry]) -> None:
@@ -97,7 +96,6 @@ class TranscriptMirrorBatcher:
         self._pending.append(_MirrorEntry(file_path, entries, size))
         self._pending_entries += len(entries)
         self._pending_bytes += size
-        self._state_generation += 1
         if (
             self._pending_entries > self.max_pending_entries
             or self._pending_bytes > self.max_pending_bytes
@@ -109,9 +107,9 @@ class TranscriptMirrorBatcher:
             # violated (parity with asyncio's unretrieved-exception warning).
             self._flush_task = spawn_detached(self._drain())
 
-    async def flush(self) -> None:
-        """Flush all pending entries, serialized after any in-flight eager flush."""
-        await self._drain()
+    async def flush(self) -> bool:
+        """Flush pending entries and return whether all transcript writes succeeded."""
+        return await self._drain()
 
     async def close(self) -> None:
         """Final transcript flush and auxiliary-state checkpoint. Never raises.
@@ -128,21 +126,16 @@ class TranscriptMirrorBatcher:
 
     async def checkpoint(self) -> None:
         """Flush transcripts, then persist auxiliary state for the same turn."""
-        await self.flush()
-        await self._persist_auxiliary_state()
+        if await self.flush():
+            await self._persist_auxiliary_state()
 
     async def _persist_auxiliary_state(self) -> None:
-        if (
-            self.config_dir is None
-            or self._state_generation <= self._persisted_state_generation
-            or not _store_implements(self.store, "persist_auxiliary_state")
+        if self.config_dir is None or not _store_implements(
+            self.store, "persist_auxiliary_state"
         ):
             return
 
         async with self._state_lock:
-            generation = self._state_generation
-            if generation <= self._persisted_state_generation:
-                return
             key = self._session_key or self.resume_key
             if key is None:
                 return
@@ -159,11 +152,11 @@ class TranscriptMirrorBatcher:
                 error = f"SessionStore.persist_auxiliary_state() failed: {e}"
                 logger.error("[SessionStore] %s", error)
             else:
-                self._persisted_state_generation = generation
+                self._auxiliary_error_reported = False
                 return
 
-            if generation > self._reported_state_generation:
-                self._reported_state_generation = generation
+            if not self._auxiliary_error_reported:
+                self._auxiliary_error_reported = True
                 try:
                     await self.on_error(
                         {
@@ -178,13 +171,15 @@ class TranscriptMirrorBatcher:
                         cb_err,
                     )
 
-    async def _drain(self) -> None:
+    async def _drain(self) -> bool:
         """Detach the pending buffer, await any prior flush, then send.
 
         Detaching happens before acquiring the lock so ``enqueue`` can keep
         accumulating into a fresh buffer while a prior flush is in flight.
-        Never raises — adapter and ``on_error`` callback errors are caught
-        and logged.
+        Returns whether every transcript write for this batcher has succeeded.
+        The false state is sticky because a dropped transcript batch cannot be
+        reconstructed by a later auxiliary snapshot. Never raises — adapter
+        and ``on_error`` callback errors are caught and logged.
         """
         items = self._pending
         self._pending = []
@@ -192,16 +187,16 @@ class TranscriptMirrorBatcher:
         self._pending_bytes = 0
         errors: list[tuple[SessionKey, str]] = []
         async with self._lock:
-            if not items:
-                return
-            try:
-                await self._do_flush(items, errors)
-            except Exception as e:  # pragma: no cover - defensive
-                # _do_flush already wraps store.append; this guards any
-                # remaining unguarded path so the "Never raises" contract
-                # holds against future regressions.
-                logger.error("[TranscriptMirrorBatcher] _do_flush raised: %s", e)
-                return
+            if items:
+                try:
+                    if not await self._do_flush(items, errors):
+                        self._transcript_healthy = False
+                except Exception as e:  # pragma: no cover - defensive
+                    # _do_flush already wraps store.append; this guards any
+                    # remaining unguarded path so the "Never raises" contract
+                    # holds against future regressions.
+                    self._transcript_healthy = False
+                    logger.error("[TranscriptMirrorBatcher] _do_flush raised: %s", e)
         # Report errors after releasing the lock so a slow on_error callback
         # cannot block subsequent drains (which only need the lock for
         # append-ordering).
@@ -213,10 +208,11 @@ class TranscriptMirrorBatcher:
                     "[TranscriptMirrorBatcher] on_error callback raised: %s",
                     cb_err,
                 )
+        return self._transcript_healthy
 
     async def _do_flush(
         self, items: list[_MirrorEntry], errors: list[tuple[SessionKey, str]]
-    ) -> None:
+    ) -> bool:
         # Coalesce by file_path so each unique file gets one append per flush
         # instead of one per enqueued frame. dict preserves first-seen order;
         # entries within a path keep enqueue order.
@@ -228,6 +224,7 @@ class TranscriptMirrorBatcher:
             else:
                 by_path[item.file_path] = list(item.entries)
 
+        succeeded_all = True
         for file_path, entries in by_path.items():
             if not entries:
                 # Avoid creating phantom keys in adapters that touch storage
@@ -235,6 +232,7 @@ class TranscriptMirrorBatcher:
                 continue
             key = file_path_to_session_key(file_path, self.projects_dir)
             if key is None:
+                succeeded_all = False
                 logger.warning(
                     "[SessionStore] dropping mirror frame: filePath %s is not "
                     "under %s -- subprocess CLAUDE_CONFIG_DIR likely differs "
@@ -279,9 +277,11 @@ class TranscriptMirrorBatcher:
                         e,
                     )
             if not succeeded:
+                succeeded_all = False
                 logger.error(
                     "[TranscriptMirrorBatcher] flush failed for %s: %s",
                     file_path,
                     last_err,
                 )
                 errors.append((key, str(last_err)))
+        return succeeded_all

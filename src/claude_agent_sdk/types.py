@@ -1729,12 +1729,16 @@ class SessionStore(Protocol):
     ) -> None:
         """Persist non-transcript session state from ``config_dir``.
 
-        Called after each completed turn, after transcript mirroring has
-        flushed. It is also retried during final client cleanup if the latest
-        checkpoint did not succeed. For a store-backed resume this happens
-        before the temporary ``CLAUDE_CONFIG_DIR`` is removed. The callback is
-        not used with a custom transport because the SDK does not own its
-        config directory.
+        Called after each completed turn when all transcript writes have
+        succeeded, and once more after the SDK-owned subprocess has stopped
+        and its final transcript frames have been drained. For a store-backed
+        resume the final call happens before the temporary
+        ``CLAUDE_CONFIG_DIR`` is removed. The callback is not used with a
+        custom transport because the SDK does not own its config directory.
+
+        After any transcript write is dropped, the SDK stops publishing
+        auxiliary snapshots for that client so a newer snapshot cannot be
+        paired with an older transcript on the next resume.
 
         Optional — if unimplemented, only transcripts are mirrored.
         ``config_dir`` may be shared by multiple sessions outside a

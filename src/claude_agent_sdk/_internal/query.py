@@ -309,10 +309,13 @@ class Query:
         """Read messages from transport and route them."""
         try:
             async for message in self.transport.read_messages():
-                if self._closed:
-                    break
-
                 msg_type = message.get("type")
+                # During shutdown, keep draining transcript mirror frames so
+                # the final store checkpoint includes writes emitted while the
+                # CLI exits. Drop other messages rather than blocking on a
+                # consumer that may already have stopped reading.
+                if self._closed and msg_type != "transcript_mirror":
+                    continue
 
                 # Route control messages
                 if msg_type == "control_response":
@@ -449,11 +452,12 @@ class Query:
         finally:
             # Flush any remaining transcript mirror entries before closing so
             # an early stdout EOF or transport error doesn't drop entries
-            # batched this turn. flush() never raises. Shielded so the await
-            # still runs when this finally is reached via cancellation.
+            # batched this turn. Auxiliary state is snapshotted by close()
+            # only after the subprocess has stopped and this reader has
+            # drained its final mirror frames.
             if self._transcript_mirror_batcher is not None:
                 with anyio.CancelScope(shield=True):
-                    await self._transcript_mirror_batcher.checkpoint()
+                    await self._transcript_mirror_batcher.flush()
             # Unblock any waiters (e.g. string-prompt path waiting for first
             # result) so they don't stall for the full timeout on early exit.
             self._first_result_event.set()
@@ -916,7 +920,7 @@ class Query:
         Unlike ``transport.close()``'s shield, this one is not bounded, and it
         covers three awaits that can reach user-supplied code:
 
-        - The final mirror flush below, which reaches a user-supplied
+        - The final mirror checkpoint below, which reaches a user-supplied
           ``SessionStore``. That flush was already shielded on its own before
           this scope existed, so nothing here makes it worse.
         - Stopping the in-process MCP servers, which cancels any tool call
@@ -942,19 +946,53 @@ class Query:
             await self._close_impl()
 
     async def _close_impl(self) -> None:
+        if self._closed:
+            return
         self._closed = True
-        # Final-flush mirror entries before tearing down so .return()/break
-        # don't drop the current turn when the process exits immediately.
-        if self._transcript_mirror_batcher is not None:
-            await self._transcript_mirror_batcher.close()
         for task in list(self._child_tasks):
             task.cancel()
         for bridge in self._sdk_mcp_bridges.values():
             await bridge.aclose()
-        if self._read_task is not None and not self._read_task.done():
+
+        # With an SDK-owned config directory, keep the reader alive while the
+        # transport stops so it can drain transcript frames emitted during
+        # subprocess shutdown. Custom transports do not support auxiliary
+        # state and retain the previous cancel-before-close behavior.
+        drain_before_snapshot = (
+            self._transcript_mirror_batcher is not None
+            and self._transcript_mirror_batcher.config_dir is not None
+        )
+        if (
+            not drain_before_snapshot
+            and self._read_task is not None
+            and not self._read_task.done()
+        ):
             self._read_task.cancel()
             await self._read_task.wait()
+
+        await self.transport.close()
+
+        if (
+            drain_before_snapshot
+            and self._read_task is not None
+            and not self._read_task.done()
+        ):
+            # The SDK subprocess has stopped, so its stdout reader should now
+            # reach EOF promptly. Bound the wait for defensive compatibility
+            # with transports whose close() does not terminate read_messages().
+            with anyio.move_on_after(5):
+                await self._read_task.wait()
+            if not self._read_task.done():
+                self._read_task.cancel()
+                await self._read_task.wait()
+
         self._read_task = None
+
+        # Snapshot auxiliary files only after the subprocess has stopped and
+        # the reader has flushed every final transcript mirror frame.
+        if self._transcript_mirror_batcher is not None:
+            await self._transcript_mirror_batcher.close()
+
         # The read task's finally closed the send side; repeat here for the
         # case where start() was never called. Do NOT close the receive
         # side — it belongs to the consumer, and anyio's receive_nowait()
@@ -964,7 +1002,6 @@ class Query:
         # EndOfStream after the buffer drains; the consumer calls
         # close_receive_stream() once it's done iterating (#859).
         self._message_send.close()
-        await self.transport.close()
 
     def close_receive_stream(self) -> None:
         """Close the receive side of the message stream.

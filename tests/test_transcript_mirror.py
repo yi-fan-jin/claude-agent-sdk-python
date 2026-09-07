@@ -223,7 +223,7 @@ class TestTranscriptMirrorBatcher:
         assert entries == [{"type": "user", "n": 1}, {"type": "assistant", "n": 2}]
 
     @pytest.mark.anyio
-    async def test_checkpoint_persists_auxiliary_state_after_transcript(
+    async def test_checkpoint_persists_auxiliary_state_without_new_transcript(
         self, tmp_path: Path
     ) -> None:
         config_dir = tmp_path / "config"
@@ -241,6 +241,7 @@ class TestTranscriptMirrorBatcher:
         batcher.enqueue(_main_path(), [{"type": "user", "n": 1}])
 
         await batcher.checkpoint()
+        (state_dir / "sess.json").write_text('{"status":"completed"}')
         await batcher.checkpoint()
 
         assert len(store.append_calls) == 1
@@ -249,6 +250,102 @@ class TestTranscriptMirrorBatcher:
                 {"project_key": "proj", "session_id": "sess"},
                 config_dir,
                 '{"status":"in_progress"}',
+            ),
+            (
+                {"project_key": "proj", "session_id": "sess"},
+                config_dir,
+                '{"status":"completed"}',
+            ),
+        ]
+
+    @pytest.mark.anyio
+    async def test_checkpoint_skips_auxiliary_state_after_transcript_failure(
+        self, tmp_path: Path
+    ) -> None:
+        class FailingTranscriptStore(_AuxiliaryStateStore):
+            fail = False
+
+            async def append(self, key, entries):
+                if self.fail:
+                    raise RuntimeError("transcript unavailable")
+                await super().append(key, entries)
+
+        config_dir = tmp_path / "config"
+        state = config_dir / "extension-state" / "proj" / "sess.json"
+        state.parent.mkdir(parents=True)
+        state.write_text('{"status":"completed"}')
+        errors: list[str] = []
+
+        async def on_error(_key: SessionKey | None, error: str) -> None:
+            errors.append(error)
+
+        store = FailingTranscriptStore()
+        batcher = TranscriptMirrorBatcher(
+            store=store,
+            projects_dir=PROJECTS_DIR,
+            on_error=on_error,
+            config_dir=config_dir,
+        )
+        batcher.enqueue(_main_path(), [{"type": "user", "n": 1}])
+        await batcher.checkpoint()
+
+        store.fail = True
+        state.write_text('{"status":"newer_than_transcript"}')
+        batcher.enqueue(_main_path(), [{"type": "assistant", "n": 2}])
+
+        with patch(_BATCHER_SLEEP, new=AsyncMock()):
+            await batcher.checkpoint()
+            await batcher.close()
+
+        assert [call[2] for call in store.state_calls] == ['{"status":"completed"}']
+        assert len(errors) == 1
+        assert "transcript unavailable" in errors[0]
+
+    @pytest.mark.anyio
+    async def test_close_snapshots_state_written_during_transport_shutdown(
+        self, tmp_path: Path
+    ) -> None:
+        config_dir = tmp_path / "config"
+        state = config_dir / "extension-state" / "proj" / "sess.json"
+        state.parent.mkdir(parents=True)
+        state.write_text('{"status":"before_shutdown"}')
+        shutdown = anyio.Event()
+
+        async def read_messages():
+            yield {
+                "type": "transcript_mirror",
+                "filePath": _main_path(),
+                "entries": [{"type": "user", "n": 1}],
+            }
+            await shutdown.wait()
+
+        async def close_transport() -> None:
+            state.write_text('{"status":"after_shutdown"}')
+            shutdown.set()
+
+        transport = AsyncMock()
+        transport.read_messages = read_messages
+        transport.close = close_transport
+        store = _AuxiliaryStateStore()
+        query_instance = Query(transport=transport, is_streaming_mode=True)
+        query_instance.set_transcript_mirror_batcher(
+            TranscriptMirrorBatcher(
+                store=store,
+                projects_dir=PROJECTS_DIR,
+                on_error=_noop_error,
+                config_dir=config_dir,
+            )
+        )
+
+        await query_instance.start()
+        await query_instance.close()
+
+        assert len(store.append_calls) == 1
+        assert store.state_calls == [
+            (
+                {"project_key": "proj", "session_id": "sess"},
+                config_dir,
+                '{"status":"after_shutdown"}',
             )
         ]
 

@@ -896,7 +896,9 @@ async def fork_session_via_store(
     no JSONL round-trip. A storage-layer copy (e.g. S3 CopyObject) is NOT
     sufficient: the transform remaps every UUID, rewrites ``sessionId`` on
     each entry, and stamps ``forkedFrom``, so the data must pass through
-    this process once.
+    this process once. Auxiliary state is not copied: its versioning and
+    rewrite semantics are adapter-specific, and a historical transcript fork
+    must not silently inherit an unrelated latest snapshot.
 
     Args:
         session_store: The store to read the source from and write the fork
