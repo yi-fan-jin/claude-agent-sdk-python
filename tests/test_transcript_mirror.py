@@ -11,7 +11,7 @@ import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import anyio
 import pytest
@@ -448,6 +448,67 @@ class TestTranscriptMirrorBatcher:
 
         assert len(store.append_calls) == 1
         assert len(store.state_calls) == 1
+
+    @pytest.mark.anyio
+    async def test_unreaped_process_closes_stdout_and_skips_auxiliary_state(
+        self, tmp_path: Path
+    ) -> None:
+        class BlockingStdout:
+            def __init__(self) -> None:
+                self.entered = anyio.Event()
+                self.closed = anyio.Event()
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                self.entered.set()
+                await self.closed.wait()
+                raise anyio.ClosedResourceError
+
+            async def aclose(self) -> None:
+                self.closed.set()
+
+        config_dir = tmp_path / "config"
+        state = config_dir / "extension-state" / "proj" / "sess.json"
+        state.parent.mkdir(parents=True)
+        state.write_text('{"status":"not_safe_to_publish"}')
+        process = MagicMock()
+        process.returncode = None
+        process.wait = AsyncMock()
+        process.terminate = MagicMock()
+        process.kill = MagicMock()
+        stdout = BlockingStdout()
+        transport = SubprocessCLITransport(
+            prompt="test", options=ClaudeAgentOptions(cli_path="/usr/bin/claude")
+        )
+        transport._process = process
+        transport._stdout_stream = stdout  # type: ignore[assignment]
+        transport._ready = True
+        store = _AuxiliaryStateStore()
+        query_instance = Query(transport=transport, is_streaming_mode=True)
+        query_instance.set_transcript_mirror_batcher(
+            TranscriptMirrorBatcher(
+                store=store,
+                projects_dir=PROJECTS_DIR,
+                on_error=_noop_error,
+                config_dir=config_dir,
+                resume_key={"project_key": "proj", "session_id": "sess"},
+            )
+        )
+
+        await query_instance.start()
+        await stdout.entered.wait()
+        with patch(
+            "claude_agent_sdk._internal.transport.subprocess_cli.anyio.fail_after",
+            side_effect=TimeoutError,
+        ):
+            await query_instance.close()
+
+        assert stdout.closed.is_set()
+        process.terminate.assert_called_once()
+        process.kill.assert_called_once()
+        assert store.state_calls == []
 
     @pytest.mark.anyio
     async def test_reader_failure_skips_final_auxiliary_snapshot(

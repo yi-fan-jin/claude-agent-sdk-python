@@ -2077,6 +2077,7 @@ class TestSubprocessCLITransport:
                 mock_process.terminate = MagicMock()
                 mock_process.kill = MagicMock()
                 mock_process.stdout = MagicMock()
+                mock_process.stdout.aclose = AsyncMock()
                 mock_process.stderr = MagicMock()
 
                 mock_stdin = MagicMock()
@@ -2104,6 +2105,8 @@ class TestSubprocessCLITransport:
 
                 mock_process.terminate.assert_called_once()
                 mock_process.kill.assert_called_once()
+                mock_process.stdout.aclose.assert_awaited_once()
+                assert transport.is_message_stream_complete() is False
 
         anyio.run(_test)
 
@@ -2131,7 +2134,10 @@ class TestSubprocessCLITransport:
                 mock_stdin.aclose = AsyncMock()
                 mock_process.stdin = mock_stdin
 
-                mock_process.wait = AsyncMock()
+                async def exit_after_sigterm():
+                    mock_process.returncode = 0
+
+                mock_process.wait = AsyncMock(side_effect=exit_after_sigterm)
 
                 mock_exec.side_effect = [mock_version_process, mock_process]
 

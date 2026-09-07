@@ -1034,6 +1034,18 @@ class SubprocessCLITransport(Transport):
                 # not one that survived SIGKILL.
                 if self._process.returncode is not None:
                     _ACTIVE_CHILDREN.discard(self._process)
+                elif self._stdout_stream is not None:
+                    # The reader captured this stream before close() clears the
+                    # transport fields. If the child survives SIGKILL, stdout
+                    # may never reach EOF and Query.close() would wait forever.
+                    # Close only on the unreaped path: a reaped process must be
+                    # allowed to drain all buffered shutdown frames normally.
+                    self._message_stream_complete = False
+                    logger.warning(
+                        "CLI process did not exit after SIGKILL; closing stdout"
+                    )
+                    with suppress(Exception):
+                        await self._stdout_stream.aclose()
 
             self._process = None
             self._stdout_stream = None
