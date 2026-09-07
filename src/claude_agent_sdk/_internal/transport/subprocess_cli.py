@@ -238,6 +238,7 @@ class SubprocessCLITransport(Transport):
         self._ready = False
         self._exit_error: Exception | None = None  # Track process exit errors
         self._message_stream_complete = True
+        self._process_wait_exhausted: anyio.Event | None = None
         self._max_buffer_size = (
             options.max_buffer_size
             if options.max_buffer_size is not None
@@ -860,6 +861,7 @@ class SubprocessCLITransport(Transport):
                 env=process_env,
                 user=self._options.user,
             )
+            self._process_wait_exhausted = anyio.Event()
             _ACTIVE_CHILDREN.add(self._process)
 
             if self._process.stdout:
@@ -1041,6 +1043,9 @@ class SubprocessCLITransport(Transport):
                     # Close only on the unreaped path: a reaped process must be
                     # allowed to drain all buffered shutdown frames normally.
                     self._message_stream_complete = False
+                    if self._process_wait_exhausted is None:
+                        self._process_wait_exhausted = anyio.Event()
+                    self._process_wait_exhausted.set()
                     logger.warning(
                         "CLI process did not exit after SIGKILL; closing stdout"
                     )
@@ -1091,6 +1096,30 @@ class SubprocessCLITransport(Transport):
         """Read and parse messages from the transport."""
         return self._read_messages_impl()
 
+    async def _wait_for_process_or_shutdown_exhaustion(
+        self, process: Process, exhausted: anyio.Event
+    ) -> int | None:
+        """Wait for exit unless close() has exhausted termination attempts."""
+        if exhausted.is_set():
+            return None
+
+        returncode: int | None = None
+
+        async def wait_for_process() -> None:
+            nonlocal returncode
+            returncode = await process.wait()
+            task_group.cancel_scope.cancel()
+
+        async def wait_for_exhaustion() -> None:
+            await exhausted.wait()
+            task_group.cancel_scope.cancel()
+
+        async with anyio.create_task_group() as task_group:
+            task_group.start_soon(wait_for_process)
+            task_group.start_soon(wait_for_exhaustion)
+
+        return returncode
+
     async def _read_messages_impl(self) -> AsyncIterator[dict[str, Any]]:
         """Internal implementation of read_messages."""
         self._message_stream_complete = True
@@ -1098,6 +1127,10 @@ class SubprocessCLITransport(Transport):
         stdout_stream = self._stdout_stream
         if process is None or stdout_stream is None:
             raise CLIConnectionError("Not connected")
+        process_wait_exhausted = self._process_wait_exhausted
+        if process_wait_exhausted is None:
+            process_wait_exhausted = anyio.Event()
+            self._process_wait_exhausted = process_wait_exhausted
 
         # The CLI writes NDJSON: one message per line. Frame the lines out of
         # the chunks the stream actually yields (see _LineFramer).
@@ -1148,9 +1181,14 @@ class SubprocessCLITransport(Transport):
 
         # Check process completion and handle errors
         try:
-            returncode = await process.wait()
+            returncode = await self._wait_for_process_or_shutdown_exhaustion(
+                process, process_wait_exhausted
+            )
         except Exception:
             returncode = -1
+
+        if returncode is None and process_wait_exhausted.is_set():
+            return
 
         # Use exit code for error detection
         if returncode is not None and returncode != 0:

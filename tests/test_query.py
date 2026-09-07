@@ -8,6 +8,7 @@ verify that both the string prompt and AsyncIterable prompt paths defer
 closing stdin until the CLI's run-ending result arrives.
 """
 
+import asyncio
 import json
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -1187,6 +1188,37 @@ class TestQueryCrossTaskCleanup:
             mock_transport.close.assert_called_once()
 
         anyio.run(_test)
+
+    def test_close_retries_after_raw_asyncio_cancellation(self):
+        """A bare task.cancel() must not leave a partial close marked done."""
+
+        async def _test():
+            close_started = anyio.Event()
+            close_calls = 0
+
+            async def close_transport():
+                nonlocal close_calls
+                close_calls += 1
+                if close_calls == 1:
+                    close_started.set()
+                    await anyio.sleep_forever()
+
+            transport = AsyncMock()
+            transport.close = close_transport
+            q = Query(transport=transport, is_streaming_mode=True)
+
+            task = asyncio.create_task(q.close())
+            await close_started.wait()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+            assert q._closed is False
+            await q.close()
+            assert q._closed is True
+            assert close_calls == 2
+
+        anyio.run(_test, backend="asyncio")
 
 
 @pytest.mark.filterwarnings(

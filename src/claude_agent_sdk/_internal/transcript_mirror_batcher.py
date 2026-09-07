@@ -150,16 +150,33 @@ class TranscriptMirrorBatcher:
         if key is None:
             return
         auxiliary_store = cast(SessionStoreAuxiliaryState, self.store)
-        try:
-            with anyio.fail_after(self.send_timeout):
-                await auxiliary_store.persist_auxiliary_state(key, self.config_dir)
-        except TimeoutError:
-            logger.error(
-                "[SessionStore] persist_auxiliary_state() timed out after %.1fs",
-                self.send_timeout,
-            )
-        except Exception as e:  # noqa: BLE001 - adapter is user code
-            logger.error("[SessionStore] persist_auxiliary_state() failed: %s", e)
+        last_err: Exception | None = None
+        for attempt in range(MIRROR_APPEND_MAX_ATTEMPTS):
+            if attempt > 0:
+                await anyio.sleep(MIRROR_APPEND_BACKOFF_S[attempt - 1])
+            try:
+                with anyio.fail_after(self.send_timeout):
+                    await auxiliary_store.persist_auxiliary_state(key, self.config_dir)
+                return
+            except TimeoutError:
+                # As with transcript append, an adapter wrapping
+                # non-cancellable I/O may still publish after our timeout.
+                # Retrying could therefore race two snapshots.
+                logger.error(
+                    "[SessionStore] persist_auxiliary_state() timed out after %.1fs",
+                    self.send_timeout,
+                )
+                return
+            except Exception as e:  # noqa: BLE001 - adapter is user code
+                last_err = e
+                logger.debug(
+                    "[SessionStore] persist_auxiliary_state() attempt %d/%d failed: %s",
+                    attempt + 1,
+                    MIRROR_APPEND_MAX_ATTEMPTS,
+                    e,
+                )
+
+        logger.error("[SessionStore] persist_auxiliary_state() failed: %s", last_err)
 
     async def _drain(self) -> bool:
         """Detach the pending buffer, await any prior flush, then send.

@@ -262,6 +262,64 @@ class TestTranscriptMirrorBatcher:
         ]
 
     @pytest.mark.anyio
+    async def test_auxiliary_state_retries_then_succeeds(self, tmp_path: Path) -> None:
+        class FlakyStateStore(_AuxiliaryStateStore):
+            attempts = 0
+
+            async def persist_auxiliary_state(self, key, config_dir):
+                self.attempts += 1
+                if self.attempts < 3:
+                    raise RuntimeError("transient state backend failure")
+                await super().persist_auxiliary_state(key, config_dir)
+
+        config_dir = tmp_path / "config"
+        state = config_dir / "extension-state" / "proj" / "sess.json"
+        state.parent.mkdir(parents=True)
+        state.write_text('{"status":"completed"}')
+        store = FlakyStateStore()
+        batcher = TranscriptMirrorBatcher(
+            store=store,
+            projects_dir=PROJECTS_DIR,
+            on_error=_noop_error,
+            config_dir=config_dir,
+            resume_key={"project_key": "proj", "session_id": "sess"},
+        )
+
+        sleep_mock = AsyncMock()
+        with patch(_BATCHER_SLEEP, new=sleep_mock):
+            await batcher.close()
+
+        assert store.attempts == 3
+        assert len(store.state_calls) == 1
+        assert [call.args[0] for call in sleep_mock.await_args_list] == [0.2, 0.8]
+
+    @pytest.mark.anyio
+    async def test_auxiliary_state_timeout_is_not_retried(self, tmp_path: Path) -> None:
+        class SlowStateStore(_RecordingStore):
+            attempts = 0
+
+            async def persist_auxiliary_state(self, key, config_dir):
+                self.attempts += 1
+                await anyio.Event().wait()
+
+        store = SlowStateStore()
+        batcher = TranscriptMirrorBatcher(
+            store=store,
+            projects_dir=PROJECTS_DIR,
+            on_error=_noop_error,
+            send_timeout=0.01,
+            config_dir=tmp_path,
+            resume_key={"project_key": "proj", "session_id": "sess"},
+        )
+
+        sleep_mock = AsyncMock()
+        with patch(_BATCHER_SLEEP, new=sleep_mock):
+            await batcher.close()
+
+        assert store.attempts == 1
+        sleep_mock.assert_not_awaited()
+
+    @pytest.mark.anyio
     async def test_close_skips_auxiliary_state_after_transcript_failure(
         self, tmp_path: Path
     ) -> None:
@@ -453,21 +511,18 @@ class TestTranscriptMirrorBatcher:
     async def test_unreaped_process_closes_stdout_and_skips_auxiliary_state(
         self, tmp_path: Path
     ) -> None:
-        class BlockingStdout:
+        class ClosedStdout:
             def __init__(self) -> None:
-                self.entered = anyio.Event()
-                self.closed = anyio.Event()
+                self.closed = False
 
             def __aiter__(self):
                 return self
 
             async def __anext__(self):
-                self.entered.set()
-                await self.closed.wait()
-                raise anyio.ClosedResourceError
+                raise StopAsyncIteration
 
             async def aclose(self) -> None:
-                self.closed.set()
+                self.closed = True
 
         config_dir = tmp_path / "config"
         state = config_dir / "extension-state" / "proj" / "sess.json"
@@ -475,10 +530,16 @@ class TestTranscriptMirrorBatcher:
         state.write_text('{"status":"not_safe_to_publish"}')
         process = MagicMock()
         process.returncode = None
-        process.wait = AsyncMock()
+        process_wait_started = anyio.Event()
+
+        async def hanging_wait():
+            process_wait_started.set()
+            await anyio.sleep_forever()
+
+        process.wait = AsyncMock(side_effect=hanging_wait)
         process.terminate = MagicMock()
         process.kill = MagicMock()
-        stdout = BlockingStdout()
+        stdout = ClosedStdout()
         transport = SubprocessCLITransport(
             prompt="test", options=ClaudeAgentOptions(cli_path="/usr/bin/claude")
         )
@@ -498,14 +559,14 @@ class TestTranscriptMirrorBatcher:
         )
 
         await query_instance.start()
-        await stdout.entered.wait()
+        await process_wait_started.wait()
         with patch(
             "claude_agent_sdk._internal.transport.subprocess_cli.anyio.fail_after",
             side_effect=TimeoutError,
         ):
             await query_instance.close()
 
-        assert stdout.closed.is_set()
+        assert stdout.closed is True
         process.terminate.assert_called_once()
         process.kill.assert_called_once()
         assert store.state_calls == []
@@ -1536,7 +1597,10 @@ class TestReceiveLoopFramePeeling:
     ) -> None:
         async def _test() -> None:
             class FailingStateStore(InMemorySessionStore):
+                attempts = 0
+
                 async def persist_auxiliary_state(self, key, config_dir):
+                    self.attempts += 1
                     raise RuntimeError("state backend unavailable")
 
             config_dir = tmp_path / "config"
@@ -1567,18 +1631,21 @@ class TestReceiveLoopFramePeeling:
                     logging.ERROR,
                     logger=transcript_mirror_batcher_module.__name__,
                 ),
+                patch(_BATCHER_SLEEP, new=AsyncMock()),
             ):
                 mock_cls.return_value = mock_transport
+                store = FailingStateStore()
                 messages = [
                     m
                     async for m in query(
                         prompt="Hello",
-                        options=ClaudeAgentOptions(session_store=FailingStateStore()),
+                        options=ClaudeAgentOptions(session_store=store),
                     )
                 ]
 
             mirror_errors = [m for m in messages if isinstance(m, MirrorErrorMessage)]
             assert mirror_errors == []
+            assert store.attempts == 3
             assert any(
                 "state backend unavailable" in record.message
                 for record in caplog.records

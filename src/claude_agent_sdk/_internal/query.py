@@ -984,7 +984,14 @@ class Query:
         (~20s worst case).
         """
         with anyio.CancelScope(shield=True):
-            await self._close_impl()
+            try:
+                await self._close_impl()
+            except BaseException:
+                # A raw asyncio cancellation bypasses the AnyIO shield. Do not
+                # permanently turn a partially completed close into a no-op:
+                # the cleanup steps below are retry-safe.
+                self._closed = False
+                raise
 
     async def _close_impl(self) -> None:
         if self._closed:
