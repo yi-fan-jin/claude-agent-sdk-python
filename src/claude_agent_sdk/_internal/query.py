@@ -504,7 +504,11 @@ class Query:
             # close() is the fallback for the buffer-full case where
             # send_nowait raises WouldBlock — receivers then exit on
             # EndOfStream after draining.
-            with suppress(anyio.ClosedResourceError, anyio.WouldBlock):
+            with suppress(
+                anyio.BrokenResourceError,
+                anyio.ClosedResourceError,
+                anyio.WouldBlock,
+            ):
                 self._message_send.send_nowait({"type": "end"})
             self._message_send.close()
 
@@ -1007,9 +1011,13 @@ class Query:
 
         if drain_before_snapshot:
             # No consumer remains during close. Release a reader already
-            # blocked on a full output buffer so it can either keep draining
-            # mirror frames or fail closed before the subprocess exits.
+            # blocked on a full output buffer so it can fail closed before the
+            # subprocess exits. Closing the send side prevents a future send;
+            # Trio additionally needs the receive side closed to wake a sender
+            # that is already parked in send().
             self._message_send.close()
+            if self._message_send.statistics().tasks_waiting_send:
+                self._message_receive.close()
 
         await self.transport.close()
 
@@ -1031,13 +1039,10 @@ class Query:
             await batcher.close()
 
         # The read task's finally closed the send side; repeat here for the
-        # case where start() was never called. Do NOT close the receive
-        # side — it belongs to the consumer, and anyio's receive_nowait()
-        # checks _closed before the buffer, so closing it here would make a
-        # non-parked consumer drop buffered messages with
-        # ClosedResourceError. _message_send.close() alone yields
-        # EndOfStream after the buffer drains; the consumer calls
-        # close_receive_stream() once it's done iterating (#859).
+        # case where start() was never called. The receive side stays open
+        # unless closing it above was required to wake a parked sender; in the
+        # normal case, the consumer drains buffered messages before calling
+        # close_receive_stream() (#859).
         self._message_send.close()
 
     def close_receive_stream(self) -> None:
