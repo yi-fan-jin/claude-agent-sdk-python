@@ -1261,11 +1261,11 @@ class TaskUpdatedMessage(SystemMessage):
 
 @dataclass
 class MirrorErrorMessage(SystemMessage):
-    """System message emitted when a :meth:`SessionStore.append` call fails.
+    """System message emitted when a :class:`SessionStore` write fails.
 
-    Non-fatal — the local-disk transcript is already durable, so the session
-    continues unaffected. The mirrored copy in the external store will be
-    missing the failed batch.
+    This covers transcript :meth:`SessionStore.append` calls and auxiliary
+    state checkpoints. It is non-fatal, so the session continues unaffected,
+    but the external store may be stale.
 
     Subclass of SystemMessage: existing ``isinstance(msg, SystemMessage)`` and
     ``case SystemMessage()`` checks continue to match. The base ``subtype``
@@ -1700,6 +1700,41 @@ class SessionStore(Protocol):
 
         Optional — if unimplemented, resume only materializes the main
         transcript.
+        """
+        raise NotImplementedError
+
+    async def materialize_auxiliary_state(
+        self, key: SessionListSubkeysKey, config_dir: Path
+    ) -> None:
+        """Restore non-transcript session state into ``config_dir``.
+
+        Called during store-backed resume after the SDK has materialized the
+        transcript, auth, settings, and subagent files, but before the Claude
+        Code subprocess starts. Implementations may restore state such as task
+        lists or plans beneath the supplied ``CLAUDE_CONFIG_DIR``.
+
+        Optional — if unimplemented, resume restores transcripts only.
+        Auxiliary state must exclude credentials, and implementations must not
+        overwrite the SDK-managed transcript/auth/settings files.
+        """
+        raise NotImplementedError
+
+    async def persist_auxiliary_state(
+        self, key: SessionListSubkeysKey, config_dir: Path
+    ) -> None:
+        """Persist non-transcript session state from ``config_dir``.
+
+        Called after each completed turn, after transcript mirroring has
+        flushed. It is also retried during final client cleanup if the latest
+        checkpoint did not succeed. For a store-backed resume this happens
+        before the temporary ``CLAUDE_CONFIG_DIR`` is removed. The callback is
+        not used with a custom transport because the SDK does not own its
+        config directory.
+
+        Optional — if unimplemented, only transcripts are mirrored.
+        Implementations should persist a complete, idempotent snapshot and
+        must not persist credentials or SDK-managed transcript/auth/settings
+        files.
         """
         raise NotImplementedError
 
@@ -2323,11 +2358,13 @@ class ClaudeAgentOptions:
     """
 
     session_store: SessionStore | None = None
-    """Mirror session transcripts to an external store.
+    """Mirror session data to an external store.
 
     When set, every transcript line written locally is also passed to
     ``session_store.append()``, and ``resume`` can materialize from the store
-    when the local file is absent.
+    when the local file is absent. Stores may optionally implement
+    ``materialize_auxiliary_state()`` and ``persist_auxiliary_state()`` to
+    preserve non-transcript state such as task lists or plans.
     """
 
     session_store_flush: SessionStoreFlushMode = "batched"
@@ -2341,8 +2378,9 @@ class ClaudeAgentOptions:
     """
 
     load_timeout_ms: int = 60_000
-    """Timeout for each ``session_store.load()`` / ``list_subkeys()`` call during
-    resume materialization, in milliseconds.
+    """Timeout for each ``session_store.load()``, ``list_subkeys()``, or
+    ``materialize_auxiliary_state()`` call during resume materialization, in
+    milliseconds.
 
     If the adapter doesn't settle within this window the query fails with a
     clear error instead of hanging the iterator forever. A value of 0 means

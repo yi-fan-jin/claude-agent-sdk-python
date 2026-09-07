@@ -153,6 +153,39 @@ class TestHappyPath:
         assert not m.config_dir.exists()
 
     @pytest.mark.anyio
+    async def test_materializes_auxiliary_state_before_spawn(
+        self, cwd: Path, project_key: str, isolated_home: Path
+    ) -> None:
+        class AuxiliaryStore(InMemorySessionStore):
+            async def materialize_auxiliary_state(self, key, config_dir):
+                assert key == {
+                    "project_key": project_key,
+                    "session_id": SESSION_ID,
+                }
+                assert (
+                    config_dir / "projects" / project_key / f"{SESSION_ID}.jsonl"
+                ).is_file()
+                task = config_dir / "tasks" / "stable-list" / "1.json"
+                task.parent.mkdir(parents=True)
+                task.write_text('{"subject":"resume me"}')
+
+        store = AuxiliaryStore()
+        await store.append(
+            {"project_key": project_key, "session_id": SESSION_ID},
+            [{"type": "user", "uuid": "u1"}],
+        )
+
+        m = await materialize_resume_session(
+            ClaudeAgentOptions(cwd=cwd, session_store=store, resume=SESSION_ID)
+        )
+        assert m is not None
+        assert m.key == {"project_key": project_key, "session_id": SESSION_ID}
+        assert (
+            m.config_dir / "tasks" / "stable-list" / "1.json"
+        ).read_text() == '{"subject":"resume me"}'
+        await m.cleanup()
+
+    @pytest.mark.anyio
     async def test_credentials_redacted(
         self, cwd: Path, project_key: str, isolated_home: Path
     ) -> None:
@@ -765,6 +798,35 @@ class TestTimeoutsAndErrors:
 
         assert created, "load() succeeded so mkdtemp should have run"
         assert not Path(created[0]).exists()
+
+    @pytest.mark.anyio
+    async def test_auxiliary_materialization_failure_cleans_temp_dir(
+        self,
+        cwd: Path,
+        project_key: str,
+        isolated_home: Path,
+        track_resume_dirs: list[Path],
+    ) -> None:
+        class FailingAuxiliaryStore(InMemorySessionStore):
+            async def materialize_auxiliary_state(self, key, config_dir):
+                raise OSError("state unavailable")
+
+        store = FailingAuxiliaryStore()
+        await store.append(
+            {"project_key": project_key, "session_id": SESSION_ID},
+            [{"type": "user", "uuid": "u1"}],
+        )
+
+        with pytest.raises(
+            RuntimeError,
+            match=r"materialize_auxiliary_state\(\).*state unavailable",
+        ):
+            await materialize_resume_session(
+                ClaudeAgentOptions(cwd=cwd, session_store=store, resume=SESSION_ID)
+            )
+
+        assert track_resume_dirs
+        assert all(not path.exists() for path in track_resume_dirs)
 
     @pytest.mark.anyio
     async def test_cancelled_after_mkdtemp_cleans_temp_dir(
@@ -1517,6 +1579,7 @@ def test_materialized_resume_dataclass() -> None:
     m = MaterializedResume(
         config_dir=Path("/tmp/x"),
         resume_session_id=str(uuid.uuid4()),
+        key={"project_key": "project", "session_id": "session"},
         cleanup=noop,
     )
     assert m.config_dir == Path("/tmp/x")

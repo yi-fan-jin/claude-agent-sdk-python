@@ -208,12 +208,12 @@ class Query:
         self._transcript_mirror_batcher = batcher
 
     def report_mirror_error(self, key: "SessionKey | None", error: str) -> None:
-        """Surface a :meth:`SessionStore.append` failure as a system message.
+        """Surface a :class:`SessionStore` write failure as a system message.
 
-        Called from the batcher's ``on_error``; the dropped batch is not
-        retried (at-most-once delivery), so this is the consumer's only signal.
-        Non-blocking — if the message buffer is full the error is logged and
-        dropped rather than back-pressuring the read loop.
+        Called from the batcher's ``on_error`` for a dropped transcript batch
+        or failed auxiliary-state checkpoint. Non-blocking — if the message
+        buffer is full the error is logged and dropped rather than
+        back-pressuring the read loop.
         """
         msg: dict[str, Any] = {
             "type": "system",
@@ -363,9 +363,10 @@ class Query:
                 if msg_type == "result":
                     # Flush pending transcript mirror entries before yielding
                     # result so consumers observing the result can rely on the
-                    # SessionStore being up to date for this turn.
+                    # SessionStore being up to date for this turn, including
+                    # any auxiliary state maintained by the CLI.
                     if self._transcript_mirror_batcher is not None:
-                        await self._transcript_mirror_batcher.flush()
+                        await self._transcript_mirror_batcher.checkpoint()
                     if self._inflight_tasks:
                         # One turn ended, but background tasks are still
                         # running and may need hook/SDK-MCP control responses
@@ -452,7 +453,7 @@ class Query:
             # still runs when this finally is reached via cancellation.
             if self._transcript_mirror_batcher is not None:
                 with anyio.CancelScope(shield=True):
-                    await self._transcript_mirror_batcher.flush()
+                    await self._transcript_mirror_batcher.checkpoint()
             # Unblock any waiters (e.g. string-prompt path waiting for first
             # result) so they don't stall for the full timeout on early exit.
             self._first_result_event.set()

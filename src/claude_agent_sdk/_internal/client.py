@@ -159,6 +159,7 @@ class InternalClient:
                     env=configured_options.env,
                     on_error=_on_mirror_error,
                     flush_mode=configured_options.session_store_flush,
+                    enable_auxiliary_state=transport is None,
                 )
             )
 

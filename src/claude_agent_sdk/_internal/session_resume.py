@@ -33,7 +33,13 @@ from typing import Any
 
 import anyio
 
-from ..types import ClaudeAgentOptions, SessionKey, SessionStore, SessionStoreFlushMode
+from ..types import (
+    ClaudeAgentOptions,
+    SessionKey,
+    SessionListSubkeysKey,
+    SessionStore,
+    SessionStoreFlushMode,
+)
 from .session_store_validation import _store_implements
 from .sessions import (
     _agent_metadata_sidecar_path,
@@ -65,12 +71,14 @@ class MaterializedResume:
         resume_session_id: Session ID to pass as ``--resume``. When the
             input was ``continue_conversation``, this is the most-recent
             session resolved via :meth:`SessionStore.list_sessions`.
+        key: Store key for the materialized session.
         cleanup: Coroutine that removes ``config_dir`` (best-effort).
             Call it after the subprocess exits.
     """
 
     config_dir: Path
     resume_session_id: str
+    key: SessionListSubkeysKey
     cleanup: Callable[[], Awaitable[None]]
 
 
@@ -100,6 +108,7 @@ def build_mirror_batcher(
     env: dict[str, str] | None,
     on_error: Callable[[SessionKey | None, str], Awaitable[None]],
     flush_mode: SessionStoreFlushMode = "batched",
+    enable_auxiliary_state: bool = True,
 ) -> TranscriptMirrorBatcher:
     """Construct the :class:`TranscriptMirrorBatcher` for a session.
 
@@ -111,12 +120,22 @@ def build_mirror_batcher(
     ``flush_mode="eager"`` zeroes the batcher's pending thresholds so every
     enqueued frame schedules a background flush; ``"batched"`` keeps the
     defaults (flush on ``result`` or 500-entry / 1 MiB overflow).
+
+    Auxiliary state is disabled for custom transports because the SDK cannot
+    know which local config directory, if any, the transport uses.
     """
     projects_dir = (
         str(materialized.config_dir / "projects")
         if materialized is not None
         else str(_get_projects_dir(env))
     )
+    config_dir = None
+    if enable_auxiliary_state:
+        config_dir = (
+            materialized.config_dir
+            if materialized is not None
+            else Path(projects_dir).parent
+        )
     eager = flush_mode == "eager"
     return TranscriptMirrorBatcher(
         store=store,
@@ -124,6 +143,8 @@ def build_mirror_batcher(
         on_error=on_error,
         max_pending_entries=0 if eager else MAX_PENDING_ENTRIES,
         max_pending_bytes=0 if eager else MAX_PENDING_BYTES,
+        config_dir=config_dir,
+        resume_key=materialized.key if materialized is not None else None,
     )
 
 
@@ -180,6 +201,15 @@ async def materialize_resume_session(
             await _materialize_subkeys(
                 store, tmp_base, project_dir, project_key, session_id, timeout_s
             )
+
+        if _store_implements(store, "materialize_auxiliary_state"):
+            await _with_timeout(
+                store.materialize_auxiliary_state(
+                    {"project_key": project_key, "session_id": session_id}, tmp_base
+                ),
+                timeout_s,
+                f"SessionStore.materialize_auxiliary_state() for session {session_id}",
+            )
     except BaseException:
         # Any failure after mkdtemp leaves tmp_base (which may already
         # contain a .credentials.json copy) on disk with no path for the
@@ -196,6 +226,7 @@ async def materialize_resume_session(
     return MaterializedResume(
         config_dir=tmp_base,
         resume_session_id=session_id,
+        key={"project_key": project_key, "session_id": session_id},
         cleanup=cleanup,
     )
 

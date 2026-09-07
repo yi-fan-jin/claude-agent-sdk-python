@@ -15,12 +15,14 @@ import json
 import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import anyio
 
-from ..types import SessionKey, SessionStore, SessionStoreEntry
+from ..types import SessionKey, SessionListSubkeysKey, SessionStore, SessionStoreEntry
 from ._task_compat import TaskHandle, spawn_detached
 from .session_store import file_path_to_session_key
+from .session_store_validation import _store_implements
 
 logger = logging.getLogger(__name__)
 
@@ -67,21 +69,35 @@ class TranscriptMirrorBatcher:
     send_timeout: float = SEND_TIMEOUT_SECONDS
     max_pending_entries: int = MAX_PENDING_ENTRIES
     max_pending_bytes: int = MAX_PENDING_BYTES
+    config_dir: Path | None = None
+    resume_key: SessionListSubkeysKey | None = None
 
     _pending: list[_MirrorEntry] = field(default_factory=list)
     _pending_entries: int = 0
     _pending_bytes: int = 0
     _flush_task: TaskHandle | None = None
     _lock: anyio.Lock = field(default_factory=anyio.Lock)
+    _session_key: SessionListSubkeysKey | None = None
+    _state_generation: int = 0
+    _persisted_state_generation: int = 0
+    _reported_state_generation: int = 0
+    _state_lock: anyio.Lock = field(default_factory=anyio.Lock)
 
     def enqueue(self, file_path: str, entries: list[SessionStoreEntry]) -> None:
         """Buffer a frame; schedule an eager flush if thresholds are exceeded."""
+        key = file_path_to_session_key(file_path, self.projects_dir)
+        if key is not None:
+            self._session_key = {
+                "project_key": key["project_key"],
+                "session_id": key["session_id"],
+            }
         # Approximate wire size — one stringify per frame (not per entry) keeps
         # this cheap relative to the json.loads the transport already did.
         size = len(json.dumps(entries))
         self._pending.append(_MirrorEntry(file_path, entries, size))
         self._pending_entries += len(entries)
         self._pending_bytes += size
+        self._state_generation += 1
         if (
             self._pending_entries > self.max_pending_entries
             or self._pending_bytes > self.max_pending_bytes
@@ -98,7 +114,7 @@ class TranscriptMirrorBatcher:
         await self._drain()
 
     async def close(self) -> None:
-        """Final flush before teardown. Never raises.
+        """Final transcript flush and auxiliary-state checkpoint. Never raises.
 
         Shielded so the final batch still reaches the store when ``close()``
         runs under a cancelled scope (client disconnect / Ctrl+C at
@@ -106,9 +122,61 @@ class TranscriptMirrorBatcher:
         """
         try:
             with anyio.CancelScope(shield=True):
-                await self.flush()
+                await self.checkpoint()
         except Exception as e:  # pragma: no cover - defensive
             logger.debug(f"[TranscriptMirrorBatcher] close flush failed: {e}")
+
+    async def checkpoint(self) -> None:
+        """Flush transcripts, then persist auxiliary state for the same turn."""
+        await self.flush()
+        await self._persist_auxiliary_state()
+
+    async def _persist_auxiliary_state(self) -> None:
+        if (
+            self.config_dir is None
+            or self._state_generation <= self._persisted_state_generation
+            or not _store_implements(self.store, "persist_auxiliary_state")
+        ):
+            return
+
+        async with self._state_lock:
+            generation = self._state_generation
+            if generation <= self._persisted_state_generation:
+                return
+            key = self._session_key or self.resume_key
+            if key is None:
+                return
+            try:
+                with anyio.fail_after(self.send_timeout):
+                    await self.store.persist_auxiliary_state(key, self.config_dir)
+            except TimeoutError:
+                error = (
+                    "SessionStore.persist_auxiliary_state() timed out after "
+                    f"{self.send_timeout:.1f}s"
+                )
+                logger.error("[SessionStore] %s", error)
+            except Exception as e:  # noqa: BLE001 - adapter is user code
+                error = f"SessionStore.persist_auxiliary_state() failed: {e}"
+                logger.error("[SessionStore] %s", error)
+            else:
+                self._persisted_state_generation = generation
+                return
+
+            if generation > self._reported_state_generation:
+                self._reported_state_generation = generation
+                try:
+                    await self.on_error(
+                        {
+                            "project_key": key["project_key"],
+                            "session_id": key["session_id"],
+                        },
+                        error,
+                    )
+                except Exception as cb_err:  # pragma: no cover - defensive
+                    logger.error(
+                        "[TranscriptMirrorBatcher] on_error callback raised: %s",
+                        cb_err,
+                    )
 
     async def _drain(self) -> None:
         """Detach the pending buffer, await any prior flush, then send.

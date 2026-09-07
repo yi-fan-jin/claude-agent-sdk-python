@@ -188,6 +188,16 @@ class _RecordingStore(InMemorySessionStore):
         await super().append(key, entries)
 
 
+class _AuxiliaryStateStore(_RecordingStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.state_calls: list[tuple[dict[str, str], Path, str]] = []
+
+    async def persist_auxiliary_state(self, key, config_dir):
+        task = config_dir / "tasks" / "stable-list" / "1.json"
+        self.state_calls.append((dict(key), config_dir, task.read_text()))
+
+
 class TestTranscriptMirrorBatcher:
     @pytest.mark.anyio
     async def test_enqueue_then_flush_calls_store_append(self) -> None:
@@ -206,6 +216,35 @@ class TestTranscriptMirrorBatcher:
         key, entries = store.append_calls[0]
         assert key == {"project_key": "proj", "session_id": "sess"}
         assert entries == [{"type": "user", "n": 1}, {"type": "assistant", "n": 2}]
+
+    @pytest.mark.anyio
+    async def test_checkpoint_persists_auxiliary_state_after_transcript(
+        self, tmp_path: Path
+    ) -> None:
+        config_dir = tmp_path / "config"
+        task = config_dir / "tasks" / "stable-list" / "1.json"
+        task.parent.mkdir(parents=True)
+        task.write_text('{"status":"in_progress"}')
+        store = _AuxiliaryStateStore()
+        batcher = TranscriptMirrorBatcher(
+            store=store,
+            projects_dir=PROJECTS_DIR,
+            on_error=_noop_error,
+            config_dir=config_dir,
+        )
+        batcher.enqueue(_main_path(), [{"type": "user", "n": 1}])
+
+        await batcher.checkpoint()
+        await batcher.checkpoint()
+
+        assert len(store.append_calls) == 1
+        assert store.state_calls == [
+            (
+                {"project_key": "proj", "session_id": "sess"},
+                config_dir,
+                '{"status":"in_progress"}',
+            )
+        ]
 
     @pytest.mark.anyio
     async def test_empty_entries_batch_skips_append(self) -> None:
@@ -575,6 +614,16 @@ class TestBuildMirrorBatcherFlushMode:
     def test_options_default_is_batched(self) -> None:
         assert ClaudeAgentOptions().session_store_flush == "batched"
 
+    def test_custom_transport_disables_auxiliary_state_callbacks(self) -> None:
+        batcher = build_mirror_batcher(
+            store=InMemorySessionStore(),
+            materialized=None,
+            env={"CLAUDE_CONFIG_DIR": str(Path(PROJECTS_DIR).parent)},
+            on_error=_noop_error,
+            enable_auxiliary_state=False,
+        )
+        assert batcher.config_dir is None
+
 
 # ---------------------------------------------------------------------------
 # --session-mirror CLI flag
@@ -740,6 +789,58 @@ class TestReceiveLoopFramePeeling:
                         appended_before_result = len(store.append_calls)
 
             assert appended_before_result == 1
+
+        anyio.run(_test)
+
+    def test_auxiliary_state_checkpoint_happens_before_result_yields(
+        self, tmp_path: Path
+    ) -> None:
+        async def _test() -> None:
+            config_dir = tmp_path / "config"
+            task = config_dir / "tasks" / "stable-list" / "1.json"
+            task.parent.mkdir(parents=True)
+            task.write_text('{"status":"completed"}')
+            projects_dir = config_dir / "projects"
+            store = _AuxiliaryStateStore()
+            mock_transport = _make_mock_transport(
+                [
+                    {
+                        "type": "transcript_mirror",
+                        "filePath": str(projects_dir / "proj" / "sess.jsonl"),
+                        "entries": [{"type": "user", "uuid": "u1"}],
+                    },
+                    _RESULT_MSG,
+                ]
+            )
+
+            with (
+                patch(
+                    "claude_agent_sdk._internal.client.SubprocessCLITransport"
+                ) as mock_cls,
+                patch(
+                    "claude_agent_sdk._internal.query.Query.initialize",
+                    new_callable=AsyncMock,
+                ),
+                patch(
+                    "claude_agent_sdk._internal.session_resume._get_projects_dir",
+                    return_value=projects_dir,
+                ),
+            ):
+                mock_cls.return_value = mock_transport
+                state_calls_at_result = None
+                async for msg in query(
+                    prompt="Hello",
+                    options=ClaudeAgentOptions(session_store=store),
+                ):
+                    if isinstance(msg, ResultMessage):
+                        state_calls_at_result = len(store.state_calls)
+
+            assert state_calls_at_result == 1
+            assert store.state_calls[0] == (
+                {"project_key": "proj", "session_id": "sess"},
+                config_dir,
+                '{"status":"completed"}',
+            )
 
         anyio.run(_test)
 
@@ -933,6 +1034,59 @@ class TestReceiveLoopFramePeeling:
             assert "disk full" in mirror_errors[0].error
             assert mirror_errors[0].key == {"project_key": "proj", "session_id": "sess"}
             # Non-fatal: result still yielded
+            assert any(isinstance(m, ResultMessage) for m in messages)
+
+        anyio.run(_test)
+
+    def test_auxiliary_state_failure_yields_mirror_error_message(
+        self, tmp_path: Path
+    ) -> None:
+        async def _test() -> None:
+            class FailingStateStore(InMemorySessionStore):
+                async def persist_auxiliary_state(self, key, config_dir):
+                    raise RuntimeError("state backend unavailable")
+
+            config_dir = tmp_path / "config"
+            projects_dir = config_dir / "projects"
+            mock_transport = _make_mock_transport(
+                [
+                    {
+                        "type": "transcript_mirror",
+                        "filePath": str(projects_dir / "proj" / "sess.jsonl"),
+                        "entries": [{"type": "user"}],
+                    },
+                    _RESULT_MSG,
+                ]
+            )
+            with (
+                patch(
+                    "claude_agent_sdk._internal.client.SubprocessCLITransport"
+                ) as mock_cls,
+                patch(
+                    "claude_agent_sdk._internal.query.Query.initialize",
+                    new_callable=AsyncMock,
+                ),
+                patch(
+                    "claude_agent_sdk._internal.session_resume._get_projects_dir",
+                    return_value=projects_dir,
+                ),
+            ):
+                mock_cls.return_value = mock_transport
+                messages = [
+                    m
+                    async for m in query(
+                        prompt="Hello",
+                        options=ClaudeAgentOptions(session_store=FailingStateStore()),
+                    )
+                ]
+
+            mirror_errors = [m for m in messages if isinstance(m, MirrorErrorMessage)]
+            assert len(mirror_errors) == 1
+            assert "state backend unavailable" in mirror_errors[0].error
+            assert mirror_errors[0].key == {
+                "project_key": "proj",
+                "session_id": "sess",
+            }
             assert any(isinstance(m, ResultMessage) for m in messages)
 
         anyio.run(_test)
