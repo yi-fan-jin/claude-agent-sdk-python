@@ -1736,9 +1736,10 @@ class SessionStore(Protocol):
         ``CLAUDE_CONFIG_DIR`` is removed. The callback is not used with a
         custom transport because the SDK does not own its config directory.
 
-        After any transcript write is dropped, the SDK stops publishing
-        auxiliary snapshots for that client so a newer snapshot cannot be
-        paired with an older transcript on the next resume.
+        After any transcript write is dropped or the output reader ends
+        abnormally, the SDK stops publishing auxiliary snapshots for that
+        client so a newer snapshot cannot be paired with an older transcript
+        on the next resume.
 
         Optional — if unimplemented, only transcripts are mirrored.
         ``config_dir`` may be shared by multiple sessions outside a

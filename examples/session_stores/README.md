@@ -60,9 +60,9 @@ format.
   It runs at completed-turn boundaries and once after subprocess shutdown so
   file changes made during shutdown are included. Checkpoint failures are
   non-fatal and reported as `MirrorErrorMessage`.
-- If a transcript append is dropped, auxiliary snapshots stop for that client;
-  this prevents a newer auxiliary snapshot from being restored beside an older
-  transcript.
+- If a transcript append is dropped or the output reader ends abnormally,
+  auxiliary snapshots stop for that client. This prevents a newer auxiliary
+  snapshot from being restored beside an older transcript.
 - If the adapter implements auxiliary state, deleting a main session key in
   `delete()` must remove that state as well as transcript subkeys. Retention
   policies must cover both.

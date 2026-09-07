@@ -5,6 +5,7 @@ in the receive loop.
 
 from __future__ import annotations
 
+import logging
 import os
 import time
 from collections.abc import Callable
@@ -23,6 +24,9 @@ from claude_agent_sdk import (
     ResultMessage,
     SessionKey,
     query,
+)
+from claude_agent_sdk._internal import (
+    transcript_mirror_batcher as transcript_mirror_batcher_module,
 )
 from claude_agent_sdk._internal.query import Query
 from claude_agent_sdk._internal.session_resume import build_mirror_batcher
@@ -351,7 +355,7 @@ class TestTranscriptMirrorBatcher:
 
     @pytest.mark.anyio
     async def test_close_skips_auxiliary_state_when_reader_cannot_drain(
-        self, tmp_path: Path
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
     ) -> None:
         config_dir = tmp_path / "config"
         state = config_dir / "extension-state" / "proj" / "sess.json"
@@ -382,15 +386,75 @@ class TestTranscriptMirrorBatcher:
 
         await query_instance.start()
         await overflow_message_yielded.wait()
-        with patch(
-            "claude_agent_sdk._internal.query.SHUTDOWN_DRAIN_TIMEOUT_SECONDS",
-            0.01,
+        with (
+            patch(
+                "claude_agent_sdk._internal.query.SHUTDOWN_DRAIN_TIMEOUT_SECONDS",
+                0.01,
+            ),
+            caplog.at_level(
+                logging.ERROR, logger=transcript_mirror_batcher_module.__name__
+            ),
         ):
             await query_instance.close()
         query_instance.close_receive_stream()
 
         assert store.append_calls == []
         assert store.state_calls == []
+        assert any(
+            "output reader did not drain before shutdown timeout" in record.message
+            for record in caplog.records
+        )
+
+    @pytest.mark.anyio
+    async def test_reader_failure_skips_final_auxiliary_snapshot(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        config_dir = tmp_path / "config"
+        state = config_dir / "extension-state" / "proj" / "sess.json"
+        state.parent.mkdir(parents=True)
+        state.write_text('{"status":"newer_than_transcript"}')
+
+        async def read_messages():
+            yield {
+                "type": "transcript_mirror",
+                "filePath": _main_path(),
+                "entries": [{"type": "user", "n": 1}],
+            }
+            raise OSError("stdout failed before trailing mirror frame")
+
+        transport = AsyncMock()
+        transport.read_messages = read_messages
+        transport.close = AsyncMock()
+        store = _AuxiliaryStateStore()
+        query_instance = Query(transport=transport, is_streaming_mode=True)
+        query_instance.set_transcript_mirror_batcher(
+            TranscriptMirrorBatcher(
+                store=store,
+                projects_dir=PROJECTS_DIR,
+                on_error=_noop_error,
+                config_dir=config_dir,
+            )
+        )
+
+        with caplog.at_level(
+            logging.ERROR, logger=transcript_mirror_batcher_module.__name__
+        ):
+            await query_instance.start()
+            await _wait_until(
+                lambda: (
+                    query_instance._read_task is not None
+                    and query_instance._read_task.done()
+                )
+            )
+            await query_instance.close()
+        query_instance.close_receive_stream()
+
+        assert len(store.append_calls) == 1
+        assert store.state_calls == []
+        assert any(
+            "stdout failed before trailing mirror frame" in record.message
+            for record in caplog.records
+        )
 
     @pytest.mark.anyio
     async def test_empty_entries_batch_skips_append(self) -> None:

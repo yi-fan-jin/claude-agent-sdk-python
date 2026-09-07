@@ -405,9 +405,23 @@ class Query:
 
         except anyio.get_cancelled_exc_class():
             # Task was cancelled - this is expected behavior
+            if (
+                self._transcript_mirror_batcher is not None
+                and self._transcript_mirror_batcher.config_dir is not None
+            ):
+                self._transcript_mirror_batcher.mark_transcript_incomplete(
+                    "output reader was cancelled before clean EOF"
+                )
             logger.debug("Read task cancelled")
             raise  # Re-raise to properly handle cancellation
         except Exception as e:
+            if (
+                self._transcript_mirror_batcher is not None
+                and self._transcript_mirror_batcher.config_dir is not None
+            ):
+                self._transcript_mirror_batcher.mark_transcript_incomplete(
+                    f"output reader failed before clean EOF: {e}"
+                )
             # When the CLI emits a result with is_error=True (e.g.
             # error_max_turns, error_during_execution, or an API failure) it
             # then exits non-zero on purpose, for shell-script consumers. The
@@ -983,7 +997,9 @@ class Query:
                 await self._read_task.wait()
             if not self._read_task.done():
                 if batcher is not None:
-                    batcher.mark_transcript_incomplete()
+                    batcher.mark_transcript_incomplete(
+                        "output reader did not drain before shutdown timeout"
+                    )
                 self._read_task.cancel()
                 await self._read_task.wait()
 
