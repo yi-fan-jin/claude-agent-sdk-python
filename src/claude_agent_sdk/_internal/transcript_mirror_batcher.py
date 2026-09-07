@@ -148,7 +148,8 @@ class TranscriptMirrorBatcher:
             if not await self.flush():
                 if checkpoint_required:
                     raise SessionStoreCheckpointError(
-                        "transcript persistence incomplete; auxiliary state was not saved"
+                        "transcript persistence incomplete; auxiliary state was not saved",
+                        retryable=False,
                     )
                 return
             if checkpoint_required:
@@ -178,7 +179,8 @@ class TranscriptMirrorBatcher:
                 # Retrying could therefore race two snapshots.
                 raise SessionStoreCheckpointError(
                     "auxiliary-state persistence timed out after "
-                    f"{self.send_timeout:g}s"
+                    f"{self.send_timeout:g}s",
+                    retryable=True,
                 ) from e
             except Exception as e:  # noqa: BLE001 - adapter is user code
                 last_err = e
@@ -190,7 +192,7 @@ class TranscriptMirrorBatcher:
                 )
 
         raise SessionStoreCheckpointError(
-            "auxiliary-state persistence failed"
+            "auxiliary-state persistence failed", retryable=True
         ) from last_err
 
     async def _drain(self) -> bool:

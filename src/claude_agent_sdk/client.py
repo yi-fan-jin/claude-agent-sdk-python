@@ -7,7 +7,7 @@ from dataclasses import asdict
 from typing import TYPE_CHECKING, Any
 
 from . import Transport
-from ._errors import CLIConnectionError
+from ._errors import CLIConnectionError, SessionStoreCheckpointError
 
 if TYPE_CHECKING:
     from ._internal.session_resume import MaterializedResume
@@ -578,14 +578,22 @@ class ClaudeSDKClient:
         does not react to cancellation (one blocked in a worker thread, say)
         is given up on after a grace period of a few seconds per server.
         """
+        checkpoint_error: SessionStoreCheckpointError | None = None
         if self._query:
-            await self._query.close()
+            try:
+                await self._query.close()
+            except SessionStoreCheckpointError as error:
+                if error.retryable:
+                    raise
+                checkpoint_error = error
             self._query.close_receive_stream()
             self._query = None
         self._transport = None
         if self._materialized is not None:
             await self._materialized.cleanup()
             self._materialized = None
+        if checkpoint_error is not None:
+            raise checkpoint_error
 
     async def __aenter__(self) -> "ClaudeSDKClient":
         """Enter async context - automatically connects with empty stream for interactive use."""

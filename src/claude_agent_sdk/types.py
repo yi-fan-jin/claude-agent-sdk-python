@@ -1264,9 +1264,11 @@ class MirrorErrorMessage(SystemMessage):
     """System message emitted when a :class:`SessionStore` write fails.
 
     This covers transcript :meth:`SessionStore.append` calls. Auxiliary-state
-    persistence happens after the message stream has drained, so those
-    failures are logged instead. Store failures are non-fatal, so the session
-    continues unaffected, but the external store may be stale.
+    persistence happens after the message stream has drained, so its failures
+    raise :class:`~claude_agent_sdk.SessionStoreCheckpointError` instead.
+    Transcript failures do not interrupt message streaming, but they also make
+    a strict auxiliary checkpoint fail when the store implements
+    :class:`SessionStoreAuxiliaryState`.
 
     Subclass of SystemMessage: existing ``isinstance(msg, SystemMessage)`` and
     ``case SystemMessage()`` checks continue to match. The base ``subtype``
@@ -1751,9 +1753,9 @@ class SessionStoreAuxiliaryState(Protocol):
         client so a newer snapshot cannot be paired with an older transcript
         on the next resume. Implementing this method opts the store into a
         strict final checkpoint: ``disconnect()`` raises
-        :class:`SessionStoreCheckpointError` when transcript or auxiliary
-        persistence is incomplete, and returns normally only after the
-        snapshot is durable.
+        :class:`~claude_agent_sdk.SessionStoreCheckpointError` when transcript
+        or auxiliary persistence is incomplete, and returns normally only
+        after the snapshot is durable.
 
         Optional — if unimplemented, only transcripts are mirrored.
         ``config_dir`` may be shared by multiple sessions outside a

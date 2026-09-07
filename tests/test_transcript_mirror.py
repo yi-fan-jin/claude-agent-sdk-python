@@ -319,10 +319,11 @@ class TestTranscriptMirrorBatcher:
             pytest.raises(
                 SessionStoreCheckpointError,
                 match="auxiliary-state persistence timed out after 0.01s",
-            ),
+            ) as exc_info,
         ):
             await batcher.close()
 
+        assert exc_info.value.retryable is True
         assert store.attempts == 1
         sleep_mock.assert_not_awaited()
 
@@ -366,10 +367,11 @@ class TestTranscriptMirrorBatcher:
             pytest.raises(
                 SessionStoreCheckpointError,
                 match="transcript persistence incomplete",
-            ),
+            ) as exc_info,
         ):
             await batcher.close()
 
+        assert exc_info.value.retryable is False
         assert store.state_calls == []
         assert len(errors) == 1
         assert "transcript unavailable" in errors[0]

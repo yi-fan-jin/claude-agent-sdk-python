@@ -33,9 +33,10 @@ class TestErrorTypes:
         assert "Failed to connect to CLI" in str(error)
 
     def test_session_store_checkpoint_error(self):
-        error = SessionStoreCheckpointError("checkpoint failed")
+        error = SessionStoreCheckpointError("checkpoint failed", retryable=True)
         assert isinstance(error, ClaudeSDKError)
         assert str(error) == "checkpoint failed"
+        assert error.retryable is True
 
     def test_process_error(self):
         """Test ProcessError with exit code and stderr."""

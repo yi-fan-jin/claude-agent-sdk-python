@@ -377,7 +377,7 @@ class TestClaudeSDKClientResourceCleanup:
             transport = AsyncMock()
             query_instance = AsyncMock()
             query_instance.close.side_effect = [
-                SessionStoreCheckpointError("checkpoint failed"),
+                SessionStoreCheckpointError("checkpoint failed", retryable=True),
                 None,
             ]
             query_instance.close_receive_stream = Mock()
@@ -402,5 +402,40 @@ class TestClaudeSDKClientResourceCleanup:
             materialized.cleanup.assert_awaited_once()
             assert client._query is None
             assert client._materialized is None
+
+        anyio.run(_test)
+
+    def test_terminal_checkpoint_failure_cleans_materialized_state(self):
+        from claude_agent_sdk import ClaudeSDKClient
+
+        async def _test():
+            transport = AsyncMock()
+            query_instance = AsyncMock()
+            query_instance.close.side_effect = SessionStoreCheckpointError(
+                "transcript incomplete", retryable=False
+            )
+            query_instance.close_receive_stream = Mock()
+            materialized = Mock()
+            materialized.cleanup = AsyncMock()
+
+            client = ClaudeSDKClient(transport=transport)
+            client._transport = transport
+            client._query = query_instance
+            client._materialized = materialized
+
+            with pytest.raises(
+                SessionStoreCheckpointError, match="transcript incomplete"
+            ) as exc_info:
+                await client.disconnect()
+
+            assert exc_info.value.retryable is False
+            query_instance.close_receive_stream.assert_called_once()
+            materialized.cleanup.assert_awaited_once()
+            assert client._query is None
+            assert client._transport is None
+            assert client._materialized is None
+
+            await client.disconnect()
+            assert query_instance.close.await_count == 1
 
         anyio.run(_test)

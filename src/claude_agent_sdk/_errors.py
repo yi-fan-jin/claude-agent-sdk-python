@@ -8,7 +8,16 @@ class ClaudeSDKError(Exception):
 
 
 class SessionStoreCheckpointError(ClaudeSDKError):
-    """Raised when a final auxiliary session checkpoint is not durable."""
+    """Raised when a final auxiliary session checkpoint is not durable.
+
+    ``retryable`` is true when a later ``disconnect()`` can retry the same
+    checkpoint. A false value means the transcript is permanently incomplete,
+    so the client has already torn down its temporary session state.
+    """
+
+    def __init__(self, message: str, *, retryable: bool):
+        self.retryable = retryable
+        super().__init__(message)
 
 
 class CLIConnectionError(ClaudeSDKError):
