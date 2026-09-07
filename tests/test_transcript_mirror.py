@@ -457,6 +457,9 @@ class TestTranscriptMirrorBatcher:
 
         await query_instance.start()
         await overflow_message_yielded.wait()
+        await _wait_until(
+            lambda: query_instance._message_send.statistics().tasks_waiting_send > 0
+        )
         with (
             caplog.at_level(
                 logging.ERROR, logger=transcript_mirror_batcher_module.__name__
@@ -467,12 +470,17 @@ class TestTranscriptMirrorBatcher:
             ),
         ):
             await query_instance.close()
+
+        buffered_messages = [
+            message async for message in query_instance.receive_messages()
+        ]
         query_instance.close_receive_stream()
 
         assert store.append_calls == []
         assert store.state_calls == []
+        assert [message["index"] for message in buffered_messages] == list(range(100))
         assert any(
-            "output reader failed before clean EOF" in record.message
+            "output reader blocked on a full message buffer" in record.message
             for record in caplog.records
         )
 
@@ -527,6 +535,98 @@ class TestTranscriptMirrorBatcher:
 
         assert len(store.append_calls) == 1
         assert len(store.state_calls) == 1
+
+    @pytest.mark.anyio
+    async def test_transcript_only_store_cancels_reader_before_transport_close(
+        self, tmp_path: Path
+    ) -> None:
+        read_started = anyio.Event()
+        reader_finished = anyio.Event()
+        release_reader = anyio.Event()
+        close_saw_reader_finished: list[bool] = []
+
+        async def read_messages():
+            try:
+                read_started.set()
+                await release_reader.wait()
+            finally:
+                reader_finished.set()
+            if False:  # pragma: no cover - make this an async generator
+                yield {}
+
+        async def close_transport() -> None:
+            close_saw_reader_finished.append(reader_finished.is_set())
+            release_reader.set()
+
+        transport = AsyncMock()
+        transport.read_messages = read_messages
+        transport.close = close_transport
+        query_instance = Query(transport=transport, is_streaming_mode=True)
+        batcher = TranscriptMirrorBatcher(
+            store=_RecordingStore(),
+            projects_dir=PROJECTS_DIR,
+            on_error=_noop_error,
+            config_dir=tmp_path,
+        )
+        query_instance.set_transcript_mirror_batcher(batcher)
+
+        await query_instance.start()
+        await read_started.wait()
+        await query_instance.close()
+
+        assert close_saw_reader_finished == [True]
+        assert batcher.auxiliary_state_enabled is False
+        assert batcher._transcript_healthy is True
+
+    @pytest.mark.anyio
+    async def test_final_reader_drain_timeout_fails_closed(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        read_started = anyio.Event()
+
+        async def read_messages():
+            read_started.set()
+            await anyio.sleep_forever()
+            if False:  # pragma: no cover - make this an async generator
+                yield {}
+
+        transport = AsyncMock()
+        transport.read_messages = read_messages
+        transport.close = AsyncMock()
+        store = _AuxiliaryStateStore()
+        query_instance = Query(transport=transport, is_streaming_mode=True)
+        query_instance.set_transcript_mirror_batcher(
+            TranscriptMirrorBatcher(
+                store=store,
+                projects_dir=PROJECTS_DIR,
+                on_error=_noop_error,
+                config_dir=tmp_path,
+                resume_key={"project_key": "proj", "session_id": "sess"},
+            )
+        )
+
+        await query_instance.start()
+        await read_started.wait()
+        with (
+            patch(
+                "claude_agent_sdk._internal.query._FINAL_READER_DRAIN_TIMEOUT_SECONDS",
+                0.01,
+            ),
+            caplog.at_level(
+                logging.ERROR, logger=transcript_mirror_batcher_module.__name__
+            ),
+            pytest.raises(
+                SessionStoreCheckpointError,
+                match="transcript persistence incomplete",
+            ),
+        ):
+            await query_instance.close()
+
+        transport.close.assert_awaited_once()
+        assert store.state_calls == []
+        assert any(
+            "did not reach EOF within" in record.message for record in caplog.records
+        )
 
     @pytest.mark.anyio
     async def test_unreaped_process_closes_stdout_and_skips_auxiliary_state(

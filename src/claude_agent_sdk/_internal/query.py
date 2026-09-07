@@ -35,6 +35,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# A reaped CLI can leave descendants holding its stdout fd open indefinitely.
+_FINAL_READER_DRAIN_TIMEOUT_SECONDS = 10.0
+
 # Task types whose completion runs a follow-up turn, and which therefore may
 # still need the control channel after the turn's result frame.
 #
@@ -411,7 +414,7 @@ class Query:
 
             if (
                 self._transcript_mirror_batcher is not None
-                and self._transcript_mirror_batcher.config_dir is not None
+                and self._transcript_mirror_batcher.auxiliary_state_enabled
                 and not self._message_stream_complete()
             ):
                 self._transcript_mirror_batcher.mark_transcript_incomplete(
@@ -422,7 +425,7 @@ class Query:
             # Task was cancelled - this is expected behavior
             if (
                 self._transcript_mirror_batcher is not None
-                and self._transcript_mirror_batcher.config_dir is not None
+                and self._transcript_mirror_batcher.auxiliary_state_enabled
             ):
                 self._transcript_mirror_batcher.mark_transcript_incomplete(
                     "output reader was cancelled before clean EOF"
@@ -441,7 +444,7 @@ class Query:
             if isinstance(e, ProcessError) and self._last_error_result is not None:
                 if (
                     self._transcript_mirror_batcher is not None
-                    and self._transcript_mirror_batcher.config_dir is not None
+                    and self._transcript_mirror_batcher.auxiliary_state_enabled
                     and not self._message_stream_complete()
                 ):
                     self._transcript_mirror_batcher.mark_transcript_incomplete(
@@ -464,7 +467,7 @@ class Query:
             else:
                 if (
                     self._transcript_mirror_batcher is not None
-                    and self._transcript_mirror_batcher.config_dir is not None
+                    and self._transcript_mirror_batcher.auxiliary_state_enabled
                 ):
                     self._transcript_mirror_batcher.mark_transcript_incomplete(
                         f"output reader failed before clean EOF: {e}"
@@ -1002,12 +1005,11 @@ class Query:
         for bridge in self._sdk_mcp_bridges.values():
             await bridge.aclose()
 
-        # With an SDK-owned config directory, keep the reader alive while the
-        # transport stops so it can drain transcript frames emitted during
-        # subprocess shutdown. Custom transports do not support auxiliary
-        # state and retain the previous cancel-before-close behavior.
+        # Only stores that opted into auxiliary checkpoints need the reader to
+        # remain alive while the transport stops. Transcript-only stores and
+        # custom transports retain the previous cancel-before-close behavior.
         batcher = self._transcript_mirror_batcher
-        drain_before_snapshot = batcher is not None and batcher.config_dir is not None
+        drain_before_snapshot = batcher is not None and batcher.auxiliary_state_enabled
         if (
             not drain_before_snapshot
             and self._read_task is not None
@@ -1016,27 +1018,40 @@ class Query:
             self._read_task.cancel()
             await self._read_task.wait()
 
-        if drain_before_snapshot:
-            # No consumer remains during close. Release a reader already
-            # blocked on a full output buffer so it can fail closed before the
-            # subprocess exits. Closing the send side prevents a future send;
-            # Trio additionally needs the receive side closed to wake a sender
-            # that is already parked in send().
-            self._message_send.close()
-            if self._message_send.statistics().tasks_waiting_send:
-                self._message_receive.close()
+        if (
+            drain_before_snapshot
+            and batcher is not None
+            and self._message_send.statistics().tasks_waiting_send
+            and self._read_task is not None
+            and not self._read_task.done()
+        ):
+            # A reader already blocked on a full output buffer cannot drain
+            # shutdown frames. Fail closed and cancel it, but leave the receive
+            # side open so the consumer can still read messages already in the
+            # buffer (#859).
+            batcher.mark_transcript_incomplete(
+                "output reader blocked on a full message buffer during shutdown"
+            )
+            self._read_task.cancel()
+            await self._read_task.wait()
 
         await self.transport.close()
 
         if (
             drain_before_snapshot
+            and batcher is not None
             and self._read_task is not None
             and not self._read_task.done()
         ):
-            # The SDK transport and SessionStore calls bound their own waits;
-            # do not raw-cancel a valid append at an unrelated shorter
-            # deadline.
-            await self._read_task.wait()
+            with anyio.move_on_after(_FINAL_READER_DRAIN_TIMEOUT_SECONDS) as scope:
+                await self._read_task.wait()
+            if scope.cancel_called and not self._read_task.done():
+                batcher.mark_transcript_incomplete(
+                    "output reader did not reach EOF within "
+                    f"{_FINAL_READER_DRAIN_TIMEOUT_SECONDS:g}s after subprocess exit"
+                )
+                self._read_task.cancel()
+                await self._read_task.wait()
 
         self._read_task = None
 
@@ -1046,9 +1061,8 @@ class Query:
             await batcher.close()
 
         # The read task's finally closed the send side; repeat here for the
-        # case where start() was never called. The receive side stays open
-        # unless closing it above was required to wake a parked sender; in the
-        # normal case, the consumer drains buffered messages before calling
+        # case where start() was never called. The receive side stays open so
+        # the consumer can drain buffered messages before calling
         # close_receive_stream() (#859).
         self._message_send.close()
 

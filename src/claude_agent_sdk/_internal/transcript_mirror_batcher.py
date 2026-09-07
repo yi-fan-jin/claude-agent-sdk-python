@@ -89,6 +89,13 @@ class TranscriptMirrorBatcher:
     _session_key: SessionListSubkeysKey | None = None
     _transcript_healthy: bool = True
 
+    @property
+    def auxiliary_state_enabled(self) -> bool:
+        """Return whether this store opted into auxiliary checkpoints."""
+        return self.config_dir is not None and _store_implements(
+            self.store, "persist_auxiliary_state"
+        )
+
     def enqueue(self, file_path: str, entries: list[SessionStoreEntry]) -> None:
         """Buffer a frame; schedule an eager flush if thresholds are exceeded."""
         key = file_path_to_session_key(file_path, self.projects_dir)
@@ -140,11 +147,7 @@ class TranscriptMirrorBatcher:
         """
         with anyio.CancelScope(shield=True):
             key = self._session_key or self.resume_key
-            checkpoint_required = (
-                self.config_dir is not None
-                and key is not None
-                and _store_implements(self.store, "persist_auxiliary_state")
-            )
+            checkpoint_required = self.auxiliary_state_enabled and key is not None
             if not await self.flush():
                 if checkpoint_required:
                     raise SessionStoreCheckpointError(
