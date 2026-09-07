@@ -21,6 +21,8 @@ from claude_agent_sdk import (
     ClaudeAgentOptions,
     InMemorySessionStore,
     MirrorErrorMessage,
+    ProcessError,
+    ResultError,
     ResultMessage,
     SessionKey,
     query,
@@ -227,7 +229,7 @@ class TestTranscriptMirrorBatcher:
         assert entries == [{"type": "user", "n": 1}, {"type": "assistant", "n": 2}]
 
     @pytest.mark.anyio
-    async def test_checkpoint_persists_auxiliary_state_without_new_transcript(
+    async def test_close_persists_final_auxiliary_state_without_new_transcript(
         self, tmp_path: Path
     ) -> None:
         config_dir = tmp_path / "config"
@@ -244,17 +246,14 @@ class TestTranscriptMirrorBatcher:
         )
         batcher.enqueue(_main_path(), [{"type": "user", "n": 1}])
 
-        await batcher.checkpoint()
+        await batcher.flush()
+        assert store.state_calls == []
+
         (state_dir / "sess.json").write_text('{"status":"completed"}')
-        await batcher.checkpoint()
+        await batcher.close()
 
         assert len(store.append_calls) == 1
         assert store.state_calls == [
-            (
-                {"project_key": "proj", "session_id": "sess"},
-                config_dir,
-                '{"status":"in_progress"}',
-            ),
             (
                 {"project_key": "proj", "session_id": "sess"},
                 config_dir,
@@ -263,7 +262,7 @@ class TestTranscriptMirrorBatcher:
         ]
 
     @pytest.mark.anyio
-    async def test_checkpoint_skips_auxiliary_state_after_transcript_failure(
+    async def test_close_skips_auxiliary_state_after_transcript_failure(
         self, tmp_path: Path
     ) -> None:
         class FailingTranscriptStore(_AuxiliaryStateStore):
@@ -291,17 +290,16 @@ class TestTranscriptMirrorBatcher:
             config_dir=config_dir,
         )
         batcher.enqueue(_main_path(), [{"type": "user", "n": 1}])
-        await batcher.checkpoint()
+        await batcher.flush()
 
         store.fail = True
         state.write_text('{"status":"newer_than_transcript"}')
         batcher.enqueue(_main_path(), [{"type": "assistant", "n": 2}])
 
         with patch(_BATCHER_SLEEP, new=AsyncMock()):
-            await batcher.checkpoint()
             await batcher.close()
 
-        assert [call[2] for call in store.state_calls] == ['{"status":"completed"}']
+        assert store.state_calls == []
         assert len(errors) == 1
         assert "transcript unavailable" in errors[0]
 
@@ -354,7 +352,7 @@ class TestTranscriptMirrorBatcher:
         ]
 
     @pytest.mark.anyio
-    async def test_close_skips_auxiliary_state_when_reader_cannot_drain(
+    async def test_close_skips_auxiliary_state_when_output_buffer_is_full(
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture
     ) -> None:
         config_dir = tmp_path / "config"
@@ -386,14 +384,8 @@ class TestTranscriptMirrorBatcher:
 
         await query_instance.start()
         await overflow_message_yielded.wait()
-        with (
-            patch(
-                "claude_agent_sdk._internal.query.SHUTDOWN_DRAIN_TIMEOUT_SECONDS",
-                0.01,
-            ),
-            caplog.at_level(
-                logging.ERROR, logger=transcript_mirror_batcher_module.__name__
-            ),
+        with caplog.at_level(
+            logging.ERROR, logger=transcript_mirror_batcher_module.__name__
         ):
             await query_instance.close()
         query_instance.close_receive_stream()
@@ -401,9 +393,61 @@ class TestTranscriptMirrorBatcher:
         assert store.append_calls == []
         assert store.state_calls == []
         assert any(
-            "output reader did not drain before shutdown timeout" in record.message
+            "output reader failed before clean EOF" in record.message
             for record in caplog.records
         )
+
+    @pytest.mark.anyio
+    async def test_close_does_not_cancel_final_transcript_append(
+        self, tmp_path: Path
+    ) -> None:
+        config_dir = tmp_path / "config"
+        state = config_dir / "extension-state" / "proj" / "sess.json"
+        state.parent.mkdir(parents=True)
+        state.write_text('{"status":"completed"}')
+        append_started = anyio.Event()
+        release_append = anyio.Event()
+
+        class SlowStore(_AuxiliaryStateStore):
+            async def append(self, key, entries):
+                append_started.set()
+                await release_append.wait()
+                await super().append(key, entries)
+
+        async def read_messages():
+            yield {
+                "type": "transcript_mirror",
+                "filePath": _main_path(),
+                "entries": [{"type": "user", "n": 1}],
+            }
+
+        transport = AsyncMock()
+        transport.read_messages = read_messages
+        transport.close = AsyncMock()
+        store = SlowStore()
+        query_instance = Query(transport=transport, is_streaming_mode=True)
+        query_instance.set_transcript_mirror_batcher(
+            TranscriptMirrorBatcher(
+                store=store,
+                projects_dir=PROJECTS_DIR,
+                on_error=_noop_error,
+                config_dir=config_dir,
+            )
+        )
+
+        await query_instance.start()
+        await append_started.wait()
+
+        async def release_later() -> None:
+            await anyio.sleep(0.02)
+            release_append.set()
+
+        async with anyio.create_task_group() as task_group:
+            task_group.start_soon(release_later)
+            await query_instance.close()
+
+        assert len(store.append_calls) == 1
+        assert len(store.state_calls) == 1
 
     @pytest.mark.anyio
     async def test_reader_failure_skips_final_auxiliary_snapshot(
@@ -455,6 +499,51 @@ class TestTranscriptMirrorBatcher:
             "stdout failed before trailing mirror frame" in record.message
             for record in caplog.records
         )
+
+    @pytest.mark.anyio
+    async def test_truncated_stdout_skips_final_auxiliary_snapshot(
+        self, tmp_path: Path
+    ) -> None:
+        config_dir = tmp_path / "config"
+        state = config_dir / "extension-state" / "proj" / "sess.json"
+        state.parent.mkdir(parents=True)
+        state.write_text('{"status":"newer_than_transcript"}')
+
+        async def read_messages():
+            yield {
+                "type": "transcript_mirror",
+                "filePath": _main_path(),
+                "entries": [{"type": "user", "n": 1}],
+            }
+
+        transport = SubprocessCLITransport(
+            prompt="test", options=ClaudeAgentOptions(cli_path="/usr/bin/claude")
+        )
+        transport.read_messages = read_messages  # type: ignore[method-assign]
+        transport.close = AsyncMock()  # type: ignore[method-assign]
+        transport._message_stream_complete = False
+        store = _AuxiliaryStateStore()
+        query_instance = Query(transport=transport, is_streaming_mode=True)
+        query_instance.set_transcript_mirror_batcher(
+            TranscriptMirrorBatcher(
+                store=store,
+                projects_dir=PROJECTS_DIR,
+                on_error=_noop_error,
+                config_dir=config_dir,
+            )
+        )
+
+        await query_instance.start()
+        await _wait_until(
+            lambda: (
+                query_instance._read_task is not None
+                and query_instance._read_task.done()
+            )
+        )
+        await query_instance.close()
+
+        assert len(store.append_calls) == 1
+        assert store.state_calls == []
 
     @pytest.mark.anyio
     async def test_empty_entries_batch_skips_append(self) -> None:
@@ -1002,9 +1091,7 @@ class TestReceiveLoopFramePeeling:
 
         anyio.run(_test)
 
-    def test_auxiliary_state_checkpoint_happens_before_result_yields(
-        self, tmp_path: Path
-    ) -> None:
+    def test_auxiliary_state_waits_for_final_reader_drain(self, tmp_path: Path) -> None:
         async def _test() -> None:
             config_dir = tmp_path / "config"
             state = config_dir / "extension-state" / "proj" / "sess.json"
@@ -1045,12 +1132,147 @@ class TestReceiveLoopFramePeeling:
                     if isinstance(msg, ResultMessage):
                         state_calls_at_result = len(store.state_calls)
 
-            assert state_calls_at_result == 1
+            assert state_calls_at_result == 0
             assert store.state_calls[0] == (
                 {"project_key": "proj", "session_id": "sess"},
                 config_dir,
                 '{"status":"completed"}',
             )
+
+        anyio.run(_test)
+
+    def test_late_mirror_failure_does_not_publish_auxiliary_state(
+        self, tmp_path: Path
+    ) -> None:
+        async def _test() -> None:
+            class LateFailingStore(_AuxiliaryStateStore):
+                async def append(self, key, entries):
+                    if any(entry.get("uuid") == "late-u1" for entry in entries):
+                        raise RuntimeError("late transcript unavailable")
+                    await super().append(key, entries)
+
+            config_dir = tmp_path / "config"
+            state = config_dir / "extension-state" / "proj" / "sess.json"
+            state.parent.mkdir(parents=True)
+            state.write_text('{"status":"newer_than_transcript"}')
+            projects_dir = config_dir / "projects"
+            store = LateFailingStore()
+            mock_transport = _make_mock_transport(
+                [
+                    {
+                        "type": "transcript_mirror",
+                        "filePath": str(projects_dir / "proj" / "sess.jsonl"),
+                        "entries": [{"type": "user", "uuid": "u1"}],
+                    },
+                    _RESULT_MSG,
+                    {
+                        "type": "transcript_mirror",
+                        "filePath": str(projects_dir / "proj" / "sess.jsonl"),
+                        "entries": [{"type": "assistant", "uuid": "late-u1"}],
+                    },
+                ]
+            )
+
+            with (
+                patch(
+                    "claude_agent_sdk._internal.client.SubprocessCLITransport"
+                ) as mock_cls,
+                patch(
+                    "claude_agent_sdk._internal.query.Query.initialize",
+                    new_callable=AsyncMock,
+                ),
+                patch(
+                    "claude_agent_sdk._internal.session_resume._get_projects_dir",
+                    return_value=projects_dir,
+                ),
+                patch(_BATCHER_SLEEP, new=AsyncMock()),
+            ):
+                mock_cls.return_value = mock_transport
+                messages = [
+                    message
+                    async for message in query(
+                        prompt="Hello",
+                        options=ClaudeAgentOptions(session_store=store),
+                    )
+                ]
+
+            assert any(isinstance(message, ResultMessage) for message in messages)
+            assert len(store.append_calls) == 1
+            assert store.state_calls == []
+
+        anyio.run(_test)
+
+    def test_expected_error_exit_publishes_auxiliary_state(
+        self, tmp_path: Path
+    ) -> None:
+        async def _test() -> None:
+            config_dir = tmp_path / "config"
+            state = config_dir / "extension-state" / "proj" / "sess.json"
+            state.parent.mkdir(parents=True)
+            state.write_text('{"status":"paused_at_turn_limit"}')
+            projects_dir = config_dir / "projects"
+            store = _AuxiliaryStateStore()
+            mock_transport = AsyncMock()
+
+            async def mock_receive():
+                yield {
+                    "type": "transcript_mirror",
+                    "filePath": str(projects_dir / "proj" / "sess.jsonl"),
+                    "entries": [{"type": "user", "uuid": "u1"}],
+                }
+                yield {
+                    "type": "result",
+                    "subtype": "error_max_turns",
+                    "is_error": True,
+                    "errors": ["Reached maximum number of turns"],
+                    "num_turns": 60,
+                    "session_id": "sess",
+                    "duration_ms": 1,
+                    "duration_api_ms": 1,
+                    "total_cost_usd": 0.0,
+                }
+                raise ProcessError(
+                    "Command failed with exit code 1", exit_code=1, stderr=""
+                )
+
+            mock_transport.read_messages = mock_receive
+            mock_transport.connect = AsyncMock()
+            mock_transport.close = AsyncMock()
+            mock_transport.end_input = AsyncMock()
+            mock_transport.write = AsyncMock()
+            mock_transport.is_ready = Mock(return_value=True)
+
+            with (
+                patch(
+                    "claude_agent_sdk._internal.client.SubprocessCLITransport"
+                ) as mock_cls,
+                patch(
+                    "claude_agent_sdk._internal.query.Query.initialize",
+                    new_callable=AsyncMock,
+                ),
+                patch(
+                    "claude_agent_sdk._internal.session_resume._get_projects_dir",
+                    return_value=projects_dir,
+                ),
+            ):
+                mock_cls.return_value = mock_transport
+                messages = []
+                with pytest.raises(ResultError, match="maximum number of turns"):
+                    async for message in query(
+                        prompt="Hello",
+                        options=ClaudeAgentOptions(session_store=store),
+                    ):
+                        messages.append(message)
+
+            assert any(isinstance(message, ResultMessage) for message in messages)
+            assert len(store.append_calls) == 1
+            assert store.state_calls == [
+                (
+                    {"project_key": "proj", "session_id": "sess"},
+                    config_dir,
+                    '{"status":"paused_at_turn_limit"}',
+                )
+            ]
 
         anyio.run(_test)
 
@@ -1248,8 +1470,8 @@ class TestReceiveLoopFramePeeling:
 
         anyio.run(_test)
 
-    def test_auxiliary_state_failure_yields_mirror_error_message(
-        self, tmp_path: Path
+    def test_auxiliary_state_failure_is_logged_after_stream_drain(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
     ) -> None:
         async def _test() -> None:
             class FailingStateStore(InMemorySessionStore):
@@ -1280,6 +1502,10 @@ class TestReceiveLoopFramePeeling:
                     "claude_agent_sdk._internal.session_resume._get_projects_dir",
                     return_value=projects_dir,
                 ),
+                caplog.at_level(
+                    logging.ERROR,
+                    logger=transcript_mirror_batcher_module.__name__,
+                ),
             ):
                 mock_cls.return_value = mock_transport
                 messages = [
@@ -1291,12 +1517,11 @@ class TestReceiveLoopFramePeeling:
                 ]
 
             mirror_errors = [m for m in messages if isinstance(m, MirrorErrorMessage)]
-            assert len(mirror_errors) == 1
-            assert "state backend unavailable" in mirror_errors[0].error
-            assert mirror_errors[0].key == {
-                "project_key": "proj",
-                "session_id": "sess",
-            }
+            assert mirror_errors == []
+            assert any(
+                "state backend unavailable" in record.message
+                for record in caplog.records
+            )
             assert any(isinstance(m, ResultMessage) for m in messages)
 
         anyio.run(_test)

@@ -16,10 +16,17 @@ import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import cast
 
 import anyio
 
-from ..types import SessionKey, SessionListSubkeysKey, SessionStore, SessionStoreEntry
+from ..types import (
+    SessionKey,
+    SessionListSubkeysKey,
+    SessionStore,
+    SessionStoreAuxiliaryState,
+    SessionStoreEntry,
+)
 from ._task_compat import TaskHandle, spawn_detached
 from .session_store import file_path_to_session_key
 from .session_store_validation import _store_implements
@@ -79,8 +86,6 @@ class TranscriptMirrorBatcher:
     _lock: anyio.Lock = field(default_factory=anyio.Lock)
     _session_key: SessionListSubkeysKey | None = None
     _transcript_healthy: bool = True
-    _auxiliary_error_reported: bool = False
-    _state_lock: anyio.Lock = field(default_factory=anyio.Lock)
 
     def enqueue(self, file_path: str, entries: list[SessionStoreEntry]) -> None:
         """Buffer a frame; schedule an eager flush if thresholds are exceeded."""
@@ -130,14 +135,10 @@ class TranscriptMirrorBatcher:
         """
         try:
             with anyio.CancelScope(shield=True):
-                await self.checkpoint()
+                if await self.flush():
+                    await self._persist_auxiliary_state()
         except Exception as e:  # pragma: no cover - defensive
             logger.debug(f"[TranscriptMirrorBatcher] close flush failed: {e}")
-
-    async def checkpoint(self) -> None:
-        """Flush transcripts, then persist auxiliary state for the same turn."""
-        if await self.flush():
-            await self._persist_auxiliary_state()
 
     async def _persist_auxiliary_state(self) -> None:
         if self.config_dir is None or not _store_implements(
@@ -145,41 +146,20 @@ class TranscriptMirrorBatcher:
         ):
             return
 
-        async with self._state_lock:
-            key = self._session_key or self.resume_key
-            if key is None:
-                return
-            try:
-                with anyio.fail_after(self.send_timeout):
-                    await self.store.persist_auxiliary_state(key, self.config_dir)
-            except TimeoutError:
-                error = (
-                    "SessionStore.persist_auxiliary_state() timed out after "
-                    f"{self.send_timeout:.1f}s"
-                )
-                logger.error("[SessionStore] %s", error)
-            except Exception as e:  # noqa: BLE001 - adapter is user code
-                error = f"SessionStore.persist_auxiliary_state() failed: {e}"
-                logger.error("[SessionStore] %s", error)
-            else:
-                self._auxiliary_error_reported = False
-                return
-
-            if not self._auxiliary_error_reported:
-                self._auxiliary_error_reported = True
-                try:
-                    await self.on_error(
-                        {
-                            "project_key": key["project_key"],
-                            "session_id": key["session_id"],
-                        },
-                        error,
-                    )
-                except Exception as cb_err:  # pragma: no cover - defensive
-                    logger.error(
-                        "[TranscriptMirrorBatcher] on_error callback raised: %s",
-                        cb_err,
-                    )
+        key = self._session_key or self.resume_key
+        if key is None:
+            return
+        auxiliary_store = cast(SessionStoreAuxiliaryState, self.store)
+        try:
+            with anyio.fail_after(self.send_timeout):
+                await auxiliary_store.persist_auxiliary_state(key, self.config_dir)
+        except TimeoutError:
+            logger.error(
+                "[SessionStore] persist_auxiliary_state() timed out after %.1fs",
+                self.send_timeout,
+            )
+        except Exception as e:  # noqa: BLE001 - adapter is user code
+            logger.error("[SessionStore] persist_auxiliary_state() failed: %s", e)
 
     async def _drain(self) -> bool:
         """Detach the pending buffer, await any prior flush, then send.

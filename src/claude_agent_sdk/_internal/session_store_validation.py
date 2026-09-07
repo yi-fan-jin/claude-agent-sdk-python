@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from ..types import ClaudeAgentOptions, SessionStore
+from ..types import ClaudeAgentOptions, SessionStore, SessionStoreAuxiliaryState
 
 
 def _store_implements(store: SessionStore, method: str) -> bool:
@@ -11,7 +11,9 @@ def _store_implements(store: SessionStore, method: str) -> bool:
     impl = getattr(store, method, None)
     if impl is None:
         return False
-    default = getattr(SessionStore, method, None)
+    default = getattr(SessionStore, method, None) or getattr(
+        SessionStoreAuxiliaryState, method, None
+    )
     return getattr(type(store), method, None) is not default
 
 

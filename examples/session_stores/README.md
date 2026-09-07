@@ -45,10 +45,9 @@ live-only. The live e2e suites for all three skip unless the corresponding
 
 ## Optional auxiliary state
 
-Adapters may implement `materialize_auxiliary_state()` and
-`persist_auxiliary_state()` for session-scoped files that are not part of the
-transcript. The SDK deliberately does not define those files or their storage
-format.
+Adapters may implement the separate `SessionStoreAuxiliaryState` capability
+for session-scoped files that are not part of the transcript. The SDK
+deliberately does not define those files or their storage format.
 
 - Treat the supplied `(project_key, session_id)` as the ownership boundary.
   On ordinary runs, `config_dir` may be shared by multiple sessions; use an
@@ -57,9 +56,9 @@ format.
 - `materialize_auxiliary_state()` receives an isolated temporary config
   directory for the resumed session. An unhandled restore error aborts resume.
 - `persist_auxiliary_state()` should write a complete, idempotent snapshot.
-  It runs at completed-turn boundaries and once after subprocess shutdown so
-  file changes made during shutdown are included. Checkpoint failures are
-  non-fatal and reported as `MirrorErrorMessage`.
+  It runs after clean subprocess shutdown and reader drain so final transcript
+  frames and file changes made during shutdown are included. Checkpoint
+  failures are non-fatal and logged after the message stream has drained.
 - If a transcript append is dropped or the output reader ends abnormally,
   auxiliary snapshots stop for that client. This prevents a newer auxiliary
   snapshot from being restored beside an older transcript.

@@ -1263,9 +1263,10 @@ class TaskUpdatedMessage(SystemMessage):
 class MirrorErrorMessage(SystemMessage):
     """System message emitted when a :class:`SessionStore` write fails.
 
-    This covers transcript :meth:`SessionStore.append` calls and auxiliary
-    state checkpoints. It is non-fatal, so the session continues unaffected,
-    but the external store may be stale.
+    This covers transcript :meth:`SessionStore.append` calls. Auxiliary-state
+    persistence happens after the message stream has drained, so those
+    failures are logged instead. Store failures are non-fatal, so the session
+    continues unaffected, but the external store may be stale.
 
     Subclass of SystemMessage: existing ``isinstance(msg, SystemMessage)`` and
     ``case SystemMessage()`` checks continue to match. The base ``subtype``
@@ -1603,7 +1604,9 @@ class SessionStore(Protocol):
     presence at runtime before invoking (the SDK never uses ``isinstance`` for
     this — a duck-typed adapter need not subclass ``SessionStore``). The
     default implementations on this Protocol raise :class:`NotImplementedError`
-    so subclasses can inherit them as "absent" markers.
+    so subclasses can inherit them as "absent" markers. Auxiliary-state hooks
+    live in the separate :class:`SessionStoreAuxiliaryState` capability so
+    adding them does not break existing structurally typed adapters.
     """
 
     async def append(self, key: SessionKey, entries: list[SessionStoreEntry]) -> None:
@@ -1703,6 +1706,14 @@ class SessionStore(Protocol):
         """
         raise NotImplementedError
 
+
+class SessionStoreAuxiliaryState(Protocol):
+    """Optional capability for persisting non-transcript session state.
+
+    Implement this alongside :class:`SessionStore` to preserve state such as
+    task lists or plans without widening the core store protocol.
+    """
+
     async def materialize_auxiliary_state(
         self, key: SessionListSubkeysKey, config_dir: Path
     ) -> None:
@@ -1729,10 +1740,9 @@ class SessionStore(Protocol):
     ) -> None:
         """Persist non-transcript session state from ``config_dir``.
 
-        Called after each completed turn when all transcript writes have
-        succeeded, and once more after the SDK-owned subprocess has stopped
-        and its final transcript frames have been drained. For a store-backed
-        resume the final call happens before the temporary
+        Called after the SDK-owned subprocess has stopped, the output reader
+        has reached clean EOF, and every transcript write has succeeded. For a
+        store-backed resume this happens before the temporary
         ``CLAUDE_CONFIG_DIR`` is removed. The callback is not used with a
         custom transport because the SDK does not own its config directory.
 
@@ -2376,9 +2386,9 @@ class ClaudeAgentOptions:
 
     When set, every transcript line written locally is also passed to
     ``session_store.append()``, and ``resume`` can materialize from the store
-    when the local file is absent. Stores may optionally implement
-    ``materialize_auxiliary_state()`` and ``persist_auxiliary_state()`` to
-    preserve non-transcript state such as task lists or plans.
+    when the local file is absent. Stores may also implement the
+    :class:`SessionStoreAuxiliaryState` capability to preserve non-transcript
+    state such as task lists or plans.
     """
 
     session_store_flush: SessionStoreFlushMode = "batched"

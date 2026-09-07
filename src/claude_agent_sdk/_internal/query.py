@@ -50,7 +50,6 @@ logger = logging.getLogger(__name__)
 # Anything added here must be a type that reliably reaches a terminal status,
 # or it will hang the query (see Query._track_task_lifecycle).
 DEFERRING_TASK_TYPES = frozenset({"local_agent", "local_workflow"})
-SHUTDOWN_DRAIN_TIMEOUT_SECONDS = 5.0
 
 
 def _error_result_text(message: dict[str, Any]) -> str:
@@ -208,13 +207,19 @@ class Query:
         """
         self._transcript_mirror_batcher = batcher
 
-    def report_mirror_error(self, key: "SessionKey | None", error: str) -> None:
-        """Surface a :class:`SessionStore` write failure as a system message.
+    def _message_stream_complete(self) -> bool:
+        """Read the transport completeness signal without tripping loose mocks."""
+        checker = getattr(type(self.transport), "is_message_stream_complete", None)
+        if checker is None:
+            return True
+        return bool(checker(self.transport))
 
-        Called from the batcher's ``on_error`` for a dropped transcript batch
-        or failed auxiliary-state checkpoint. Non-blocking — if the message
-        buffer is full the error is logged and dropped rather than
-        back-pressuring the read loop.
+    def report_mirror_error(self, key: "SessionKey | None", error: str) -> None:
+        """Surface a transcript mirror failure as a system message.
+
+        Called from the batcher's ``on_error`` for a dropped transcript batch.
+        Non-blocking — if the message buffer is full the error is logged and
+        dropped rather than back-pressuring the read loop.
         """
         msg: dict[str, Any] = {
             "type": "system",
@@ -367,10 +372,11 @@ class Query:
                 if msg_type == "result":
                     # Flush pending transcript mirror entries before yielding
                     # result so consumers observing the result can rely on the
-                    # SessionStore being up to date for this turn, including
-                    # any auxiliary state maintained by the CLI.
+                    # transcript SessionStore being up to date for this turn.
+                    # Auxiliary state waits for clean reader EOF because the
+                    # CLI may emit additional mirror frames after result.
                     if self._transcript_mirror_batcher is not None:
-                        await self._transcript_mirror_batcher.checkpoint()
+                        await self._transcript_mirror_batcher.flush()
                     if self._inflight_tasks:
                         # One turn ended, but background tasks are still
                         # running and may need hook/SDK-MCP control responses
@@ -403,6 +409,15 @@ class Query:
                 # Regular SDK messages go to the stream
                 await self._message_send.send(message)
 
+            if (
+                self._transcript_mirror_batcher is not None
+                and self._transcript_mirror_batcher.config_dir is not None
+                and not self._message_stream_complete()
+            ):
+                self._transcript_mirror_batcher.mark_transcript_incomplete(
+                    "output reader dropped a truncated final JSON frame"
+                )
+
         except anyio.get_cancelled_exc_class():
             # Task was cancelled - this is expected behavior
             if (
@@ -415,13 +430,6 @@ class Query:
             logger.debug("Read task cancelled")
             raise  # Re-raise to properly handle cancellation
         except Exception as e:
-            if (
-                self._transcript_mirror_batcher is not None
-                and self._transcript_mirror_batcher.config_dir is not None
-            ):
-                self._transcript_mirror_batcher.mark_transcript_incomplete(
-                    f"output reader failed before clean EOF: {e}"
-                )
             # When the CLI emits a result with is_error=True (e.g.
             # error_max_turns, error_during_execution, or an API failure) it
             # then exits non-zero on purpose, for shell-script consumers. The
@@ -431,6 +439,14 @@ class Query:
             # TypeScript SDK (Query.ts readMessages).
             pending_error: Exception = e
             if isinstance(e, ProcessError) and self._last_error_result is not None:
+                if (
+                    self._transcript_mirror_batcher is not None
+                    and self._transcript_mirror_batcher.config_dir is not None
+                    and not self._message_stream_complete()
+                ):
+                    self._transcript_mirror_batcher.mark_transcript_incomplete(
+                        f"output reader failed before clean EOF: {e}"
+                    )
                 error_text = (
                     f"Claude Code returned an error result: "
                     f"{_error_result_text(self._last_error_result)}"
@@ -446,6 +462,13 @@ class Query:
                     e.exit_code,
                 )
             else:
+                if (
+                    self._transcript_mirror_batcher is not None
+                    and self._transcript_mirror_batcher.config_dir is not None
+                ):
+                    self._transcript_mirror_batcher.mark_transcript_incomplete(
+                        f"output reader failed before clean EOF: {e}"
+                    )
                 error_text = str(e)
                 logger.error(f"Fatal error in message reader: {e}")
             # Signal all pending control requests so they fail fast instead of
@@ -461,15 +484,14 @@ class Query:
             # (ResultError / ProcessError with its exit code,
             # CLIJSONDecodeError, ...) instead of flattening it to a bare
             # Exception(str).
-            await self._message_send.send(
-                {"type": "error", "error": error_text, "exception": pending_error}
-            )
+            if not self._closed:
+                await self._message_send.send(
+                    {"type": "error", "error": error_text, "exception": pending_error}
+                )
         finally:
-            # Flush any remaining transcript mirror entries before closing so
-            # an early stdout EOF or transport error doesn't drop entries
-            # batched this turn. Auxiliary state is snapshotted by close()
-            # only after the subprocess has stopped and this reader has
-            # drained its final mirror frames.
+            # Flush final mirror frames before closing the stream. Auxiliary
+            # state is published later by close(), after the reader has fully
+            # drained and the subprocess has stopped.
             if self._transcript_mirror_batcher is not None:
                 with anyio.CancelScope(shield=True):
                     await self._transcript_mirror_batcher.flush()
@@ -482,7 +504,7 @@ class Query:
             # close() is the fallback for the buffer-full case where
             # send_nowait raises WouldBlock — receivers then exit on
             # EndOfStream after draining.
-            with suppress(anyio.WouldBlock):
+            with suppress(anyio.ClosedResourceError, anyio.WouldBlock):
                 self._message_send.send_nowait({"type": "end"})
             self._message_send.close()
 
@@ -935,9 +957,9 @@ class Query:
         Unlike ``transport.close()``'s shield, this one is not bounded, and it
         covers three awaits that can reach user-supplied code:
 
-        - The final mirror checkpoint below, which reaches a user-supplied
-          ``SessionStore``. That flush was already shielded on its own before
-          this scope existed, so nothing here makes it worse.
+        - Waiting for the reader to drain, whose final mirror checkpoint
+          reaches a user-supplied ``SessionStore``. That checkpoint is
+          independently shielded and bounded by the store timeout.
         - Stopping the in-process MCP servers, which cancels any tool call
           still running. ``SdkMcpBridge`` bounds that wait itself: a tool
           that does not react to cancellation (one blocked in a worker
@@ -983,6 +1005,12 @@ class Query:
             self._read_task.cancel()
             await self._read_task.wait()
 
+        if drain_before_snapshot:
+            # No consumer remains during close. Release a reader already
+            # blocked on a full output buffer so it can either keep draining
+            # mirror frames or fail closed before the subprocess exits.
+            self._message_send.close()
+
         await self.transport.close()
 
         if (
@@ -990,18 +1018,10 @@ class Query:
             and self._read_task is not None
             and not self._read_task.done()
         ):
-            # The SDK subprocess has stopped, so its stdout reader should now
-            # reach EOF promptly. Bound the wait for defensive compatibility
-            # with transports whose close() does not terminate read_messages().
-            with anyio.move_on_after(SHUTDOWN_DRAIN_TIMEOUT_SECONDS):
-                await self._read_task.wait()
-            if not self._read_task.done():
-                if batcher is not None:
-                    batcher.mark_transcript_incomplete(
-                        "output reader did not drain before shutdown timeout"
-                    )
-                self._read_task.cancel()
-                await self._read_task.wait()
+            # The SDK transport and SessionStore calls bound their own waits;
+            # do not raw-cancel a valid append at an unrelated shorter
+            # deadline.
+            await self._read_task.wait()
 
         self._read_task = None
 

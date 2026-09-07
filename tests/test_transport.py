@@ -2200,6 +2200,52 @@ class TestSubprocessCLITransport:
 
         anyio.run(_test)
 
+    def test_reader_keeps_process_reference_while_close_clears_transport(self):
+        """A concurrent close must not turn clean reader EOF into ProcessError(-1)."""
+
+        async def _test():
+            class BlockingEOF:
+                def __init__(self):
+                    self.entered = anyio.Event()
+                    self.release = anyio.Event()
+
+                def __aiter__(self):
+                    return self
+
+                async def __anext__(self):
+                    self.entered.set()
+                    await self.release.wait()
+                    raise StopAsyncIteration
+
+            process = MagicMock()
+            process.returncode = 0
+            process.wait = AsyncMock(return_value=0)
+            stream = BlockingEOF()
+            transport = SubprocessCLITransport(prompt="test", options=make_options())
+            transport._process = process
+            transport._stdout_stream = stream  # type: ignore[assignment]
+            transport._ready = True
+            errors: list[Exception] = []
+
+            async def read() -> None:
+                try:
+                    async for _ in transport.read_messages():
+                        pass
+                except Exception as exc:  # pragma: no cover - assertion captures it
+                    errors.append(exc)
+
+            async with anyio.create_task_group() as task_group:
+                task_group.start_soon(read)
+                await stream.entered.wait()
+                await transport.close()
+                assert transport._process is None
+                stream.release.set()
+
+            assert errors == []
+            process.wait.assert_awaited_once()
+
+        anyio.run(_test)
+
     def test_build_command_agents_always_via_initialize(self):
         """Test that --agents is NEVER passed via CLI.
 

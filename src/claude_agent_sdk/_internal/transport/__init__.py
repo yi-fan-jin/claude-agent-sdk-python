@@ -45,6 +45,15 @@ class Transport(ABC):
         """
         pass
 
+    def is_message_stream_complete(self) -> bool:
+        """Return whether the last read ended on a complete message boundary.
+
+        Custom transports default to complete. Implementations that silently
+        discard an incomplete trailing frame should override this so callers
+        do not checkpoint state beyond the messages they received.
+        """
+        return True
+
     @abstractmethod
     async def close(self) -> None:
         """Close the transport connection and clean up resources.

@@ -237,6 +237,7 @@ class SubprocessCLITransport(Transport):
         self._stderr_task: TaskHandle | None = None
         self._ready = False
         self._exit_error: Exception | None = None  # Track process exit errors
+        self._message_stream_complete = True
         self._max_buffer_size = (
             options.max_buffer_size
             if options.max_buffer_size is not None
@@ -1080,7 +1081,10 @@ class SubprocessCLITransport(Transport):
 
     async def _read_messages_impl(self) -> AsyncIterator[dict[str, Any]]:
         """Internal implementation of read_messages."""
-        if not self._process or not self._stdout_stream:
+        self._message_stream_complete = True
+        process = self._process
+        stdout_stream = self._stdout_stream
+        if process is None or stdout_stream is None:
             raise CLIConnectionError("Not connected")
 
         # The CLI writes NDJSON: one message per line. Frame the lines out of
@@ -1098,7 +1102,7 @@ class SubprocessCLITransport(Transport):
                 )
 
         try:
-            async for chunk in self._stdout_stream:
+            async for chunk in stdout_stream:
                 for line in framer.push(chunk):
                     guard(len(line))
                     data = _parse_stdout_line(line)
@@ -1107,7 +1111,10 @@ class SubprocessCLITransport(Transport):
                 guard(framer.pending_len)
 
         except anyio.ClosedResourceError:
-            pass
+            # A clean subprocess EOF ends async iteration normally. A closed
+            # resource may have cut the stream off between complete frames,
+            # even when the current tail happens to parse successfully.
+            self._message_stream_complete = False
         except GeneratorExit:
             # Client disconnected: return without falling through to the
             # process-exit check, since awaiting there would make CPython
@@ -1121,6 +1128,7 @@ class SubprocessCLITransport(Transport):
         try:
             data = _parse_stdout_line(tail)
         except SDKJSONDecodeError:
+            self._message_stream_complete = False
             logger.debug("Dropping truncated JSON at end of CLI stdout: %s", tail[:200])
             data = None
         if data is not None:
@@ -1128,7 +1136,7 @@ class SubprocessCLITransport(Transport):
 
         # Check process completion and handle errors
         try:
-            returncode = await self._process.wait()
+            returncode = await process.wait()
         except Exception:
             returncode = -1
 
@@ -1187,3 +1195,7 @@ class SubprocessCLITransport(Transport):
     def is_ready(self) -> bool:
         """Check if transport is ready for communication."""
         return self._ready
+
+    def is_message_stream_complete(self) -> bool:
+        """Return whether stdout ended without a truncated JSON frame."""
+        return self._message_stream_complete

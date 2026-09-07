@@ -29,7 +29,7 @@ from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import anyio
 
@@ -38,6 +38,7 @@ from ..types import (
     SessionKey,
     SessionListSubkeysKey,
     SessionStore,
+    SessionStoreAuxiliaryState,
     SessionStoreFlushMode,
 )
 from .session_store_validation import _store_implements
@@ -203,8 +204,9 @@ async def materialize_resume_session(
             )
 
         if _store_implements(store, "materialize_auxiliary_state"):
+            auxiliary_store = cast(SessionStoreAuxiliaryState, store)
             await _with_timeout(
-                store.materialize_auxiliary_state(
+                auxiliary_store.materialize_auxiliary_state(
                     {"project_key": project_key, "session_id": session_id}, tmp_base
                 ),
                 timeout_s,

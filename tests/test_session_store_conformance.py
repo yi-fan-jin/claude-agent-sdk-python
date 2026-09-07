@@ -14,6 +14,7 @@ from claude_agent_sdk import (
     InMemorySessionStore,
     SessionKey,
     SessionStore,
+    SessionStoreAuxiliaryState,
     project_key_for_directory,
 )
 from claude_agent_sdk._internal.session_store_validation import (
@@ -91,6 +92,12 @@ class TestInMemorySessionStore:
         store = InMemorySessionStore()
         assert _store_implements(store, "append")
         assert _store_implements(store, "list_sessions")
+
+        class NoAuxiliaryOverrides(InMemorySessionStore, SessionStoreAuxiliaryState):
+            pass
+
+        auxiliary_defaults = NoAuxiliaryOverrides()
+        assert not _store_implements(auxiliary_defaults, "materialize_auxiliary_state")
         with pytest.raises(TypeError):
             isinstance(store, SessionStore)
 

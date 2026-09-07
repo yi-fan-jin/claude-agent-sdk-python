@@ -134,6 +134,7 @@ from .types import (
     SessionListSubkeysKey,
     SessionMessage,
     SessionStore,
+    SessionStoreAuxiliaryState,
     SessionStoreEntry,
     SessionStoreFlushMode,
     SessionStoreListEntry,
@@ -724,6 +725,7 @@ __all__ = [
     # Session store
     "SessionKey",
     "SessionStore",
+    "SessionStoreAuxiliaryState",
     "SessionStoreEntry",
     "SessionStoreFlushMode",
     "SessionStoreListEntry",

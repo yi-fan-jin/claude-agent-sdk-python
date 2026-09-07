@@ -497,13 +497,39 @@ class TestSubprocessBuffering:
 
         assert messages == [{"type": "result"}]
 
-    def test_final_message_without_trailing_newline_is_yielded(self) -> None:
-        """A last message with no trailing newline must still be delivered when
-        the stream ends, including when it ends by closing the resource."""
-
+    def test_clean_eof_delivers_valid_tail_and_marks_stream_complete(self) -> None:
         messages: list[Any] = []
+        stream_complete = False
 
         async def _run() -> None:
+            nonlocal stream_complete
+            transport = SubprocessCLITransport(prompt="t", options=make_options())
+            transport._process = MagicMock()
+            transport._process.wait = AsyncMock(return_value=0)
+            transport._stdout_stream = MockTextReceiveStream(
+                [json.dumps({"type": "result", "subtype": "success"})]
+            )
+            transport._stderr_stream = MockTextReceiveStream([])
+            async for message in transport.read_messages():
+                messages.append(message)
+            stream_complete = transport.is_message_stream_complete()
+
+        anyio.run(_run)
+
+        assert messages == [{"type": "result", "subtype": "success"}]
+        assert stream_complete is True
+
+    def test_closed_stdout_delivers_valid_tail_but_marks_stream_incomplete(
+        self,
+    ) -> None:
+        """A valid buffered tail is delivered, but an external close is unsafe."""
+
+        messages: list[Any] = []
+        stream_complete = True
+
+        async def _run() -> None:
+            nonlocal stream_complete
+
             class ClosingStream:
                 def __init__(self, chunks: list[str]) -> None:
                     self.chunks = chunks
@@ -530,16 +556,33 @@ class TestSubprocessBuffering:
             transport._stderr_stream = MockTextReceiveStream([])
             async for m in transport.read_messages():
                 messages.append(m)
+            stream_complete = transport.is_message_stream_complete()
 
         anyio.run(_run)
 
         assert messages == [{"type": "result", "subtype": "success"}]
+        assert stream_complete is False
 
     def test_truncated_final_line_is_dropped_not_raised(self) -> None:
         """A residual tail cut off mid-write is unrecoverable; drop it quietly
-        rather than raising on the way out of a stream that already ended."""
+        rather than raising on the way out of a stream that already ended, but
+        record that the message stream was incomplete."""
         chunks = [json.dumps({"type": "result"}) + "\n" + '{"type":"assist']
+        messages: list[Any] = []
+        stream_complete = True
 
-        messages = self._collect(chunks)
+        async def _run() -> None:
+            nonlocal stream_complete
+            transport = SubprocessCLITransport(prompt="t", options=make_options())
+            transport._process = MagicMock()
+            transport._process.wait = AsyncMock(return_value=0)
+            transport._stdout_stream = MockTextReceiveStream(chunks)
+            transport._stderr_stream = MockTextReceiveStream([])
+            async for message in transport.read_messages():
+                messages.append(message)
+            stream_complete = transport.is_message_stream_complete()
+
+        anyio.run(_run)
 
         assert messages == [{"type": "result"}]
+        assert stream_complete is False
