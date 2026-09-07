@@ -22,6 +22,7 @@ harness:
 import pytest
 from claude_agent_sdk.testing import run_session_store_conformance
 
+
 @pytest.mark.anyio
 async def test_my_store_conformance():
     await run_session_store_conformance(lambda: MyStore(...))
@@ -58,7 +59,13 @@ deliberately does not define those files or their storage format.
 - `persist_auxiliary_state()` should write a complete, idempotent snapshot.
   It runs after clean subprocess shutdown and reader drain so final transcript
   frames and file changes made during shutdown are included. Checkpoint
-  failures are non-fatal and logged after the message stream has drained.
+  failures raise `SessionStoreCheckpointError` after the message stream has
+  drained. Retryable auxiliary-store failures retain the temporary session
+  state for another `disconnect()` attempt, but copied auth/settings files are
+  removed immediately. While a checkpoint is pending, the client rejects new
+  queries and reconnects; retry `disconnect()`, or call
+  `disconnect(discard_checkpoint=True)` to explicitly discard that state and
+  finish cleanup. Permanently incomplete transcripts are torn down directly.
 - If a transcript append is dropped or the output reader ends abnormally,
   auxiliary snapshots stop for that client. This prevents a newer auxiliary
   snapshot from being restored beside an older transcript.
@@ -77,9 +84,11 @@ through the relevant items below.
 
 - `run_session_store_conformance` proves *correctness*, not *resilience* —
   load-test your adapter under your expected throughput.
-- `append()` failures are logged and emit a `MirrorErrorMessage`; they never
-  block the conversation. Monitor for these so silent mirror gaps don't go
-  unnoticed.
+- `append()` failures are logged and emit a `MirrorErrorMessage`; they do not
+  interrupt the message stream. For stores that also implement auxiliary
+  persistence, they make the final strict checkpoint fail because a consistent
+  transcript-and-auxiliary snapshot cannot be published. Monitor for these so
+  silent mirror gaps don't go unnoticed.
 
 ### S3
 

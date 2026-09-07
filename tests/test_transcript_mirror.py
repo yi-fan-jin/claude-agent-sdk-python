@@ -1673,7 +1673,7 @@ class TestReceiveLoopFramePeeling:
                 with pytest.raises(
                     SessionStoreCheckpointError,
                     match="auxiliary-state persistence failed",
-                ):
+                ) as exc_info:
                     async for message in query(
                         prompt="Hello",
                         options=ClaudeAgentOptions(session_store=store),
@@ -1683,6 +1683,7 @@ class TestReceiveLoopFramePeeling:
             mirror_errors = [m for m in messages if isinstance(m, MirrorErrorMessage)]
             assert mirror_errors == []
             assert store.attempts == 3
+            assert exc_info.value.retryable is False
             assert any(isinstance(m, ResultMessage) for m in messages)
 
         anyio.run(_test)

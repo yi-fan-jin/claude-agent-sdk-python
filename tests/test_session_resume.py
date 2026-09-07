@@ -20,6 +20,7 @@ from claude_agent_sdk import (
     ClaudeSDKClient,
     CLIConnectionError,
     InMemorySessionStore,
+    SessionStoreCheckpointError,
     query,
 )
 from claude_agent_sdk._internal.session_resume import (
@@ -1398,6 +1399,105 @@ class TestSpawnFailureCleanup:
             assert not d.exists(), f"leaked temp dir {d}"
 
     @pytest.mark.anyio
+    async def test_client_initialize_failure_is_not_masked_by_checkpoint_failure(
+        self,
+        cwd: Path,
+        project_key: str,
+        isolated_home: Path,
+        track_resume_dirs: list[Path],
+    ) -> None:
+        class FailingAuxiliaryStore(InMemorySessionStore):
+            async def persist_auxiliary_state(self, key, config_dir):
+                raise RuntimeError("checkpoint unavailable")
+
+        store = FailingAuxiliaryStore()
+        await store.append(
+            {"project_key": project_key, "session_id": SESSION_ID},
+            [{"type": "user", "uuid": "u1"}],
+        )
+        mock_transport = _make_mock_transport()
+        client = ClaudeSDKClient(
+            options=ClaudeAgentOptions(cwd=cwd, session_store=store, resume=SESSION_ID)
+        )
+
+        with (
+            patch(
+                "claude_agent_sdk._internal.transport.subprocess_cli."
+                "SubprocessCLITransport",
+                return_value=mock_transport,
+            ),
+            patch(
+                "claude_agent_sdk._internal.query.Query.initialize",
+                new_callable=AsyncMock,
+                side_effect=CLIConnectionError("control timeout"),
+            ),
+            patch(
+                "claude_agent_sdk._internal.transcript_mirror_batcher.anyio.sleep",
+                new=AsyncMock(),
+            ),
+            pytest.raises(CLIConnectionError, match="control timeout"),
+        ):
+            await client.connect()
+
+        assert client._query is None
+        assert client._transport is None
+        assert client._materialized is None
+        assert client._checkpoint_error is None
+        assert track_resume_dirs
+        for directory in track_resume_dirs:
+            assert not directory.exists(), f"leaked temp dir {directory}"
+
+    @pytest.mark.anyio
+    async def test_one_shot_checkpoint_failure_is_terminal_after_cleanup(
+        self,
+        cwd: Path,
+        project_key: str,
+        isolated_home: Path,
+        track_resume_dirs: list[Path],
+    ) -> None:
+        class FailingAuxiliaryStore(InMemorySessionStore):
+            async def persist_auxiliary_state(self, key, config_dir):
+                raise RuntimeError("checkpoint unavailable")
+
+        store = FailingAuxiliaryStore()
+        await store.append(
+            {"project_key": project_key, "session_id": SESSION_ID},
+            [{"type": "user", "uuid": "u1"}],
+        )
+        mock_transport = _make_mock_transport()
+
+        with (
+            patch(
+                "claude_agent_sdk._internal.client.SubprocessCLITransport",
+                return_value=mock_transport,
+            ),
+            patch(
+                "claude_agent_sdk._internal.query.Query.initialize",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "claude_agent_sdk._internal.transcript_mirror_batcher.anyio.sleep",
+                new=AsyncMock(),
+            ),
+            pytest.raises(
+                SessionStoreCheckpointError,
+                match="auxiliary-state persistence failed",
+            ) as exc_info,
+        ):
+            async for _ in query(
+                prompt="Hello",
+                options=ClaudeAgentOptions(
+                    cwd=cwd, session_store=store, resume=SESSION_ID
+                ),
+            ):
+                pass
+
+        assert exc_info.value.retryable is False
+        assert track_resume_dirs
+        for directory in track_resume_dirs:
+            assert not directory.exists(), f"leaked temp dir {directory}"
+
+    @pytest.mark.anyio
     async def test_connect_cancelled_before_spawn_removes_temp_dir(
         self,
         cwd: Path,
@@ -1588,3 +1688,79 @@ def test_materialized_resume_dataclass() -> None:
         cleanup=noop,
     )
     assert m.config_dir == Path("/tmp/x")
+
+
+@pytest.mark.anyio
+async def test_materialized_resume_cleanup_auth_retains_auxiliary_state(
+    tmp_path: Path,
+) -> None:
+    async def noop() -> None:
+        pass
+
+    for name in (
+        ".credentials.json",
+        ".claude.json",
+        "settings.json",
+        "cowork_settings.json",
+    ):
+        (tmp_path / name).write_text("sensitive")
+    auxiliary = tmp_path / "extension-state" / "session.json"
+    auxiliary.parent.mkdir()
+    auxiliary.write_text("state")
+
+    materialized = MaterializedResume(
+        config_dir=tmp_path,
+        resume_session_id=str(uuid.uuid4()),
+        key={"project_key": "project", "session_id": "session"},
+        cleanup=noop,
+    )
+    await materialized.cleanup_auth()
+
+    assert not any(
+        (tmp_path / name).exists()
+        for name in (
+            ".credentials.json",
+            ".claude.json",
+            "settings.json",
+            "cowork_settings.json",
+        )
+    )
+    assert auxiliary.read_text() == "state"
+
+
+@pytest.mark.anyio
+async def test_materialized_resume_cleanup_auth_retries_transient_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def noop() -> None:
+        pass
+
+    credentials = tmp_path / ".credentials.json"
+    credentials.write_text("sensitive")
+    real_unlink = Path.unlink
+    attempts = 0
+
+    def flaky_unlink(path: Path, *args: Any, **kwargs: Any) -> None:
+        nonlocal attempts
+        if path == credentials:
+            attempts += 1
+            if attempts <= 2:
+                raise PermissionError(errno.EPERM, "held by indexer")
+        real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", flaky_unlink)
+    materialized = MaterializedResume(
+        config_dir=tmp_path,
+        resume_session_id=str(uuid.uuid4()),
+        key={"project_key": "project", "session_id": "session"},
+        cleanup=noop,
+    )
+
+    with patch(
+        "claude_agent_sdk._internal.session_resume.anyio.sleep",
+        new=AsyncMock(),
+    ):
+        await materialized.cleanup_auth()
+
+    assert attempts == 3
+    assert not credentials.exists()

@@ -6,6 +6,7 @@ from collections.abc import AsyncGenerator, AsyncIterable, AsyncIterator
 from dataclasses import asdict
 from typing import Any
 
+from .._errors import SessionStoreCheckpointError
 from ..types import (
     ClaudeAgentOptions,
     Message,
@@ -53,8 +54,14 @@ class InternalClient:
         )
         inner = self._process_query_inner(prompt, options, transport, materialized)
         try:
-            async for msg in inner:
-                yield msg
+            try:
+                async for msg in inner:
+                    yield msg
+            except SessionStoreCheckpointError as error:
+                # A one-shot query always tears down below, so there is no
+                # client state on which disconnect() could retry.
+                error.retryable = False
+                raise
         finally:
             # ``async for`` does NOT close its iterator when the loop body
             # raises (PEP 533 was deferred). Explicitly aclose the inner
@@ -62,7 +69,11 @@ class InternalClient:
             # i.e. the subprocess is terminated — *before* we remove the temp
             # CLAUDE_CONFIG_DIR it is reading/writing.
             try:
-                await inner.aclose()
+                try:
+                    await inner.aclose()
+                except SessionStoreCheckpointError as error:
+                    error.retryable = False
+                    raise
             finally:
                 # The temp dir holds a .credentials.json copy — remove it on
                 # every exit path, including transport spawn failure before
@@ -193,5 +204,7 @@ class InternalClient:
                     yield message
 
         finally:
-            await query.close()
-            query.close_receive_stream()
+            try:
+                await query.close()
+            finally:
+                query.close_receive_stream()

@@ -60,6 +60,12 @@ logger = logging.getLogger(__name__)
 # Default macOS Keychain service name for OAuth credentials when
 # CLAUDE_CONFIG_DIR is unset (production OAUTH_FILE_SUFFIX is empty).
 _KEYCHAIN_SERVICE_NAME = "Claude Code-credentials"
+_MATERIALIZED_AUTH_FILES = (
+    ".credentials.json",
+    ".claude.json",
+    "settings.json",
+    "cowork_settings.json",
+)
 
 
 @dataclass
@@ -81,6 +87,11 @@ class MaterializedResume:
     resume_session_id: str
     key: SessionListSubkeysKey
     cleanup: Callable[[], Awaitable[None]]
+
+    async def cleanup_auth(self) -> None:
+        """Remove copied auth/settings while retaining retryable session state."""
+        for name in _MATERIALIZED_AUTH_FILES:
+            await _unlink_with_retry(self.config_dir / name)
 
 
 def apply_materialized_options(
@@ -282,6 +293,29 @@ async def _rmtree_with_retry(
             shutil.rmtree(path, ignore_errors=True)
             raise
     shutil.rmtree(path, ignore_errors=True)
+
+
+async def _unlink_with_retry(
+    path: Path, *, retries: int = 4, delay: float = 0.1
+) -> None:
+    """Best-effort unlink with the same transient-lock retries as cleanup()."""
+    for _ in range(retries):
+        try:
+            path.unlink(missing_ok=True)
+            return
+        except OSError as e:
+            if e.errno not in _RETRYABLE_RMTREE_ERRNOS and not isinstance(
+                e, PermissionError
+            ):
+                break
+        try:
+            await anyio.sleep(delay)
+        except anyio.get_cancelled_exc_class():
+            with suppress(OSError):
+                path.unlink(missing_ok=True)
+            raise
+    with suppress(OSError):
+        path.unlink(missing_ok=True)
 
 
 async def _load_candidate(

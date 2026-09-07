@@ -76,12 +76,20 @@ class ClaudeSDKClient:
         self._custom_transport = transport
         self._transport: Transport | None = None
         self._query: Any | None = None
+        self._checkpoint_query: Any | None = None
         self._materialized: MaterializedResume | None = None
+        self._checkpoint_error: SessionStoreCheckpointError | None = None
 
     async def connect(
         self, prompt: str | AsyncIterable[dict[str, Any]] | None = None
     ) -> None:
         """Connect to Claude with a prompt or message stream."""
+
+        if self._checkpoint_error is not None:
+            raise CLIConnectionError(
+                "A session checkpoint is pending; retry disconnect() or call "
+                "disconnect(discard_checkpoint=True) before reconnecting."
+            )
 
         from ._internal.session_resume import materialize_resume_session
         from ._internal.session_store_validation import validate_session_store_options
@@ -123,7 +131,7 @@ class ClaudeSDKClient:
             # removing the temp CLAUDE_CONFIG_DIR it points at. disconnect()
             # already orders close() → cleanup() and is None-safe for
             # pre-spawn failures, so reuse it here.
-            await self.disconnect()
+            await self.disconnect(discard_checkpoint=True)
             raise
 
     async def _connect_inner(
@@ -256,6 +264,11 @@ class ClaudeSDKClient:
             prompt: Either a string message or an async iterable of message dictionaries
             session_id: Session identifier for the conversation
         """
+        if self._checkpoint_error is not None:
+            raise CLIConnectionError(
+                "A session checkpoint is pending; retry disconnect() or call "
+                "disconnect(discard_checkpoint=True) before sending another query."
+            )
         if not self._query or not self._transport:
             raise CLIConnectionError("Not connected. Call connect() first.")
 
@@ -571,28 +584,46 @@ class ClaudeSDKClient:
             if isinstance(message, ResultMessage):
                 return
 
-    async def disconnect(self) -> None:
+    async def disconnect(self, *, discard_checkpoint: bool = False) -> None:
         """Disconnect from Claude.
 
         Any SDK MCP tool call still running is cancelled first; a tool that
         does not react to cancellation (one blocked in a worker thread, say)
         is given up on after a grace period of a few seconds per server.
+
+        A retryable :class:`SessionStoreCheckpointError` keeps the auxiliary
+        state needed for another ``disconnect()`` attempt while immediately
+        removing copied auth/settings files. Until then, ``query()`` and
+        ``connect()`` are blocked. Pass ``discard_checkpoint=True`` to abandon
+        that pending checkpoint and clean up without retrying it.
         """
         checkpoint_error: SessionStoreCheckpointError | None = None
-        if self._query:
-            try:
-                await self._query.close()
-            except SessionStoreCheckpointError as error:
-                if error.retryable:
-                    raise
-                checkpoint_error = error
-            self._query.close_receive_stream()
+        query = self._checkpoint_query or self._query
+        if query:
+            if discard_checkpoint and self._checkpoint_error is not None:
+                checkpoint_error = self._checkpoint_error
+            else:
+                try:
+                    await query.close()
+                except SessionStoreCheckpointError as error:
+                    self._checkpoint_error = error
+                    if error.retryable and not discard_checkpoint:
+                        self._checkpoint_query = query
+                        self._query = None
+                        self._transport = None
+                        if self._materialized is not None:
+                            await self._materialized.cleanup_auth()
+                        raise
+                    checkpoint_error = error
+            query.close_receive_stream()
             self._query = None
+            self._checkpoint_query = None
         self._transport = None
         if self._materialized is not None:
             await self._materialized.cleanup()
             self._materialized = None
-        if checkpoint_error is not None:
+        self._checkpoint_error = None
+        if checkpoint_error is not None and not discard_checkpoint:
             raise checkpoint_error
 
     async def __aenter__(self) -> "ClaudeSDKClient":
