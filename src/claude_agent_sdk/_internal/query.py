@@ -50,6 +50,7 @@ logger = logging.getLogger(__name__)
 # Anything added here must be a type that reliably reaches a terminal status,
 # or it will hang the query (see Query._track_task_lifecycle).
 DEFERRING_TASK_TYPES = frozenset({"local_agent", "local_workflow"})
+SHUTDOWN_DRAIN_TIMEOUT_SECONDS = 5.0
 
 
 def _error_result_text(message: dict[str, Any]) -> str:
@@ -958,10 +959,8 @@ class Query:
         # transport stops so it can drain transcript frames emitted during
         # subprocess shutdown. Custom transports do not support auxiliary
         # state and retain the previous cancel-before-close behavior.
-        drain_before_snapshot = (
-            self._transcript_mirror_batcher is not None
-            and self._transcript_mirror_batcher.config_dir is not None
-        )
+        batcher = self._transcript_mirror_batcher
+        drain_before_snapshot = batcher is not None and batcher.config_dir is not None
         if (
             not drain_before_snapshot
             and self._read_task is not None
@@ -980,9 +979,11 @@ class Query:
             # The SDK subprocess has stopped, so its stdout reader should now
             # reach EOF promptly. Bound the wait for defensive compatibility
             # with transports whose close() does not terminate read_messages().
-            with anyio.move_on_after(5):
+            with anyio.move_on_after(SHUTDOWN_DRAIN_TIMEOUT_SECONDS):
                 await self._read_task.wait()
             if not self._read_task.done():
+                if batcher is not None:
+                    batcher.mark_transcript_incomplete()
                 self._read_task.cancel()
                 await self._read_task.wait()
 
@@ -990,8 +991,8 @@ class Query:
 
         # Snapshot auxiliary files only after the subprocess has stopped and
         # the reader has flushed every final transcript mirror frame.
-        if self._transcript_mirror_batcher is not None:
-            await self._transcript_mirror_batcher.close()
+        if batcher is not None:
+            await batcher.close()
 
         # The read task's finally closed the send side; repeat here for the
         # case where start() was never called. Do NOT close the receive

@@ -350,6 +350,49 @@ class TestTranscriptMirrorBatcher:
         ]
 
     @pytest.mark.anyio
+    async def test_close_skips_auxiliary_state_when_reader_cannot_drain(
+        self, tmp_path: Path
+    ) -> None:
+        config_dir = tmp_path / "config"
+        state = config_dir / "extension-state" / "proj" / "sess.json"
+        state.parent.mkdir(parents=True)
+        state.write_text('{"status":"not_safe_to_publish"}')
+        overflow_message_yielded = anyio.Event()
+
+        async def read_messages():
+            for index in range(101):
+                if index == 100:
+                    overflow_message_yielded.set()
+                yield {"type": "system", "subtype": "noop", "index": index}
+
+        transport = AsyncMock()
+        transport.read_messages = read_messages
+        transport.close = AsyncMock()
+        store = _AuxiliaryStateStore()
+        query_instance = Query(transport=transport, is_streaming_mode=True)
+        query_instance.set_transcript_mirror_batcher(
+            TranscriptMirrorBatcher(
+                store=store,
+                projects_dir=PROJECTS_DIR,
+                on_error=_noop_error,
+                config_dir=config_dir,
+                resume_key={"project_key": "proj", "session_id": "sess"},
+            )
+        )
+
+        await query_instance.start()
+        await overflow_message_yielded.wait()
+        with patch(
+            "claude_agent_sdk._internal.query.SHUTDOWN_DRAIN_TIMEOUT_SECONDS",
+            0.01,
+        ):
+            await query_instance.close()
+        query_instance.close_receive_stream()
+
+        assert store.append_calls == []
+        assert store.state_calls == []
+
+    @pytest.mark.anyio
     async def test_empty_entries_batch_skips_append(self) -> None:
         store = _RecordingStore()
         batcher = TranscriptMirrorBatcher(

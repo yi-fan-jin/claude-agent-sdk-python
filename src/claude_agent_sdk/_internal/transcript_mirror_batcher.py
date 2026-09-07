@@ -111,6 +111,10 @@ class TranscriptMirrorBatcher:
         """Flush pending entries and return whether all transcript writes succeeded."""
         return await self._drain()
 
+    def mark_transcript_incomplete(self) -> None:
+        """Prevent auxiliary publication when final mirror frames may be missing."""
+        self._transcript_healthy = False
+
     async def close(self) -> None:
         """Final transcript flush and auxiliary-state checkpoint. Never raises.
 
